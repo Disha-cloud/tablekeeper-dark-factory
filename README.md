@@ -34,14 +34,71 @@ docker build -t tablekeeper-stage4 stage-4 && docker run --rm -e PORT=8080 -p 80
 ```
 
 - The service listens on `0.0.0.0:$PORT` (default 8080). `GET /health` returns `200 {"status":"ok"}`.
-- No manual setup is needed, and the service makes no outbound network calls at run time. From
-  stage 2 on, all HTML, JS and CSS are served from the image, and the UI uses system fonts only.
+- No setup is needed to run the service or pass the harness, and the service makes no outbound
+  network calls at run time. From stage 2 on, all HTML, JS and CSS are served from the image,
+  and the UI uses system fonts only.
+- The service starts **empty by design**: there are no restaurants or users until a fixture is
+  loaded (`GET /restaurants` returns `{"restaurants":[]}`). To try it by hand, seed demo data
+  first; see [Seed demo data for manual testing](#seed-demo-data-for-manual-testing).
 - From stage 2 on, the browser UI is at `/` (search and availability grid), `/signup`, `/login`
   and `/lookup`.
 - Stack: Python 3.12 on `python:3.12-slim`. The app is a plain ASGI app (`app.py`, standard
   library only) served by uvicorn with one worker (`server.py`). Its only dependencies are
   `uvicorn` and `tzdata`. All state is held in memory, and every read-check-write runs under
   one global lock (decision D1).
+
+### Seed demo data for manual testing
+
+**To seed demo data for manual testing**, run this once after the container is up (port 8080),
+before deciding that the service is empty or broken. It works for every stage and should print
+`204`:
+
+```
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/_test/reset \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "users": [
+    {"id": "u_ada", "email": "ada@example.com", "password": "correct horse", "display_name": "Ada"}
+  ],
+  "restaurants": [
+    {"id": "r_anker", "name": "Zum Anker", "timezone": "Europe/Berlin",
+     "slot_minutes": 30, "reservation_duration_minutes": 90, "cancellation_cutoff_minutes": 120,
+     "opening_hours": [
+       {"weekday": "mon", "opens": "17:00", "closes": "23:00"},
+       {"weekday": "tue", "opens": "17:00", "closes": "23:00"},
+       {"weekday": "wed", "opens": "17:00", "closes": "23:00"},
+       {"weekday": "thu", "opens": "17:00", "closes": "23:00"},
+       {"weekday": "fri", "opens": "17:00", "closes": "23:00"},
+       {"weekday": "sat", "opens": "12:00", "closes": "23:00"},
+       {"weekday": "sun", "opens": "12:00", "closes": "22:00"}
+     ],
+     "tables": [
+       {"id": "t_1", "label": "Window 1", "capacity": 2},
+       {"id": "t_2", "label": "Booth 2", "capacity": 4},
+       {"id": "t_3", "label": "Booth 3", "capacity": 4}
+     ],
+     "combinable": [["t_2", "t_3"]]}
+  ],
+  "reservations": [
+    {"id": "res_demo1", "reference": "DEMO0001", "user_id": "u_ada", "restaurant_id": "r_anker",
+     "table_id": "t_2", "party_size": 4, "starts_at_local": "2027-06-18T19:00"}
+  ]
+}'
+```
+
+`POST /_test/reset` **replaces all in-memory state** with this fixture, so anything booked
+before it is gone. You can re-run it at any time to start over. What to try once it is seeded:
+
+- **API (all stages):** `GET /restaurants` lists Zum Anker. Log in with
+  `POST /auth/login` `{"email":"ada@example.com","password":"correct horse"}`, then
+  `GET /reservations/DEMO0001` with `Authorization: Bearer <token>` returns Ada's booking.
+  Stage 1 is API only.
+- **Browser UI (stage 2 on):** open http://localhost:8080/, choose Zum Anker, the date
+  2027-06-18 and a party of 4. From 18:00 to 20:00, Booth 2 (`t_2`) is taken by `DEMO0001`, so only
+  Booth 3 is offered. For a party of 8, the only option is Booth 2 + Booth 3 combined (stage 2
+  adds combined tables), and it is unavailable from 18:00 to 20:00 for the same reason.
+- **Look up and cancel:** sign in at `/login` as `ada@example.com` / `correct horse`, then
+  enter `DEMO0001` at `/lookup`.
 
 ### Self-tests
 
