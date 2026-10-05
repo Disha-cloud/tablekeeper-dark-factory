@@ -538,6 +538,37 @@ def main():
                 no_hscroll(page, "auth-error@%d" % vw)
         t_viewports()
 
+        @step("no stray null/undefined/[object Object]/NaN text on any route, signed out and in, 375 and 1280")
+        def t_no_junk():
+            junk = re.compile(r"(^|\W)(null|undefined|NaN)(\W|$)|\[object Object\]")
+            for signed_in in (False, True):
+                if signed_in:
+                    ui_login(page)
+                else:
+                    page.goto(BASE)
+                    if page.locator('[data-testid="logout-button"]').count():
+                        tid(page, "logout-button").click()
+                for vw in (375, 1280):
+                    page.set_viewport_size({"width": vw, "height": 800})
+                    for path in ("/", "/signup", "/login", "/lookup"):
+                        page.goto(BASE + path)
+                        page.wait_for_timeout(150)
+                        for sel in ("body", "#site-header"):
+                            txt = page.inner_text(sel)
+                            assert not junk.search(txt), (signed_in, vw, path, sel, txt[-120:])
+                        hdr = page.inner_text("#site-header")
+                        assert not hdr.strip().endswith("null")
+                    if signed_in:
+                        page.goto(BASE + "/lookup")
+                        tid(page, "lookup-reference-input").fill("CUTREF01")
+                        tid(page, "lookup-submit").click()
+                        expect(tid(page, "reservation-detail")).to_be_visible()
+                        assert not junk.search(page.inner_text("body")), "lookup detail"
+                        tid(page, "reservation-cancel-button").click()
+                        expect(tid(page, "reservation-error")).to_be_visible()
+                        assert not junk.search(page.inner_text("body")), "lookup error"
+        t_no_junk()
+
         @step("keyboard focus is visible and no external requests / JS errors")
         def t_focus():
             page.goto(BASE + "/login")

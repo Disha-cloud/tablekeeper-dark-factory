@@ -23,6 +23,9 @@
     return el;
   }
 
+  // replaceChildren/append stringify null into text nodes; always filter first.
+  const kids = (...a) => a.flat(Infinity).filter((x) => x !== null && x !== undefined && x !== false);
+
   function uuid() {
     const c = window.crypto;
     if (c && c.randomUUID) return c.randomUUID();
@@ -111,7 +114,7 @@
   }
   function renderHeader() {
     const hd = $('#site-header');
-    hd.replaceChildren(
+    hd.replaceChildren(...kids(
       h('a', { class: 'brand', href: '/', 'data-nav': '' },
         h('span', { html: '<svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="26" fill="none" stroke="#f6e7c8" stroke-width="5"/><circle cx="32" cy="32" r="10" fill="#f6e7c8"/></svg>' }),
         'Tablekeeper'),
@@ -122,7 +125,7 @@
           session ? null : [navItem('/login', 'Sign in'), navItem('/signup', 'Sign up')])),
       session ? h('div', { class: 'header-user' },
         h('span', { class: 'user-chip', 'data-testid': 'current-user', title: 'Signed in' }, session.name),
-        h('button', { type: 'button', class: 'btn header-btn', 'data-testid': 'logout-button', onclick: logout }, 'Sign out')) : null);
+        h('button', { type: 'button', class: 'btn header-btn', 'data-testid': 'logout-button', onclick: logout }, 'Sign out')) : null));
   }
   function logout() {
     setSession(null);
@@ -539,7 +542,7 @@
       const names = ids.map(label).join(' + ');
       const cancelBtn = res.status === 'confirmed'
         ? h('button', { type: 'button', class: 'btn danger', 'data-testid': 'reservation-cancel-button', onclick: () => cancel(res, rest, mine, cancelBtn) }, 'Cancel reservation') : null;
-      out.replaceChildren(
+      out.replaceChildren(...kids(
         h('div', { class: 'card', 'data-testid': 'reservation-detail' },
           h('h2', {}, rest ? rest.name : 'Your reservation'),
           h('p', {}, h('span', { class: `status-badge ${res.status}`, 'data-testid': 'reservation-status' }, res.status)),
@@ -549,7 +552,7 @@
             h('dt', {}, 'Seating'), h('dd', { 'data-testid': 'reservation-tables' }, names),
             h('dt', {}, 'Party'), h('dd', {}, `${res.party_size} ${res.party_size === 1 ? 'guest' : 'guests'}`)),
           cancelBtn ? h('div', { class: 'actions' }, cancelBtn) : null),
-        errText ? errBox(errText) : null);
+        errText ? errBox(errText) : null));
     }
 
     async function cancel(res, rest, mine, btn2) {
