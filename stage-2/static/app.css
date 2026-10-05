@@ -171,6 +171,7 @@ dl.facts dd { margin: 0; overflow-wrap: anywhere; }
   .card { padding: .9rem; }
   .site-header { padding: .5rem .75rem; }
   .ref { font-size: 1.5rem; }
+  table.slots tbody th { min-width: 6.2rem; max-width: 7.5rem; padding: .4rem .5rem; font-size: .88rem; }
   .booking .row .field { max-width: none; }
   dl.facts { grid-template-columns: 1fr; }
   dl.facts dt { margin-top: .3rem; }
