@@ -75,3 +75,6 @@ Deliverable: `stage-2/` in `/Users/chiraanths/Desktop/lockin/Band-hack/band-work
 
 ## E12 Clarification of E11 (developer question on fe7547c)
 - A huge but well-formed positive integer `party_size` is a valid integer ≥ 1, so the stage-1 rule applies: it is 422 `party_exceeds_capacity` (after the slot rule chain), not `validation_failed`. E11's "422 `validation_failed`" example is superseded; the only E11 requirement is that such bodies are never 400 or 5xx. `validation_failed` stays reserved for `party_size` that is not an integer or is < 1.
+
+## Status
+- Stage 2 ACCEPTED at 74fb95b: review r1 REJECT (stray "null" in header) → fix round 1 → review r2 ACCEPT, release-verifier r1 ACCEPT (harness isolated: stage-1 120/120, stage-2 25/25, claimed stage 2; stage-1 still claims 1; reports checks/graded-s2-release-r1-1 and -s1).
