@@ -72,3 +72,6 @@ Deliverable: `stage-2/` in `/Users/chiraanths/Desktop/lockin/Band-hack/band-work
 ## E11 Stage-1 deferrals (D14) resolved in stage 2
 - Response timestamps always use a 4-digit zero-padded year (`%04d`), and offsets that are not whole minutes are rendered rounded to the minute so the result is valid RFC 3339 `±HH:MM`.
 - JSON bodies with integers beyond Python's default 4300-digit limit must not be 400: parse them (e.g. `sys.set_int_max_str_digits(0)` at startup, or a parse hook) and validate as usual, so an absurd `party_size` is 422 `validation_failed` and an absurd fixture number is handled per D13 (200/204 or 422). Never 5xx, and a request must still finish within 5 s.
+
+## E12 Clarification of E11 (developer question on fe7547c)
+- A huge but well-formed positive integer `party_size` is a valid integer ≥ 1, so the stage-1 rule applies: it is 422 `party_exceeds_capacity` (after the slot rule chain), not `validation_failed`. E11's "422 `validation_failed`" example is superseded; the only E11 requirement is that such bodies are never 400 or 5xx. `validation_failed` stays reserved for `party_size` that is not an integer or is < 1.
