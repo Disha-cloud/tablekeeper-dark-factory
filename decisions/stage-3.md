@@ -73,3 +73,6 @@ Deliverable: `stage-3/` in `/Users/chiraanths/Desktop/lockin/Band-hack/band-work
 - Policy `effective_from` is stored as a validated zero-padded `YYYY-MM-DD` and compared as such.
 - Import validates schema-3 history (sequential `seq`) and series links; corrupt state → 422 with no change.
 - Policy 0 keeps the fixture's unbounded numeric values (D13); the stage-3 ranges (1..1440, 0..10080, 1..100) apply to published policies only.
+
+## Status
+- Stage 3 ACCEPTED at ba2bcfc: review r1 ACCEPT (no defects), release-verifier r1 ACCEPT (harness isolated: stage-1 120/120, stage-2 25/25, stage-3 7/7, claimed stage 3; `--all`: stage-1/2/3 claim 1/2/3; reports checks/graded-s3-release-r1-1 and -all).
