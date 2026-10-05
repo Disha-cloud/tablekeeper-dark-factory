@@ -38,6 +38,7 @@ REF_RE = re.compile(r"[A-Z0-9]{6,12}")
 TZ_RE = re.compile(r"[A-Za-z0-9_+\-/]{1,64}")
 PW_RE = re.compile(r"scrypt\$16384\$8\$1\$[0-9a-f]{32}\$[0-9a-f]{64}")
 DIGITS_RE = re.compile(r"[0-9]+")
+LOCAL_TIME_RE = re.compile(r"([01][0-9]|2[0-3]):[0-5][0-9]")
 
 
 class ApiError(Exception):
@@ -378,11 +379,22 @@ class Rest:
                          {t["id"]: t["capacity"] for t in self.tables})
         self.policies = []
         self.revision = 0
+        self.closures = []
         if importing:
             rev = d.get("revision", 0)
             if not (is_int(rev) and rev >= 0):
                 raise Invalid("revision")
             self.revision = rev
+            cls = d.get("closures", [])
+            if not isinstance(cls, list):
+                raise Invalid("closures")
+            for c in cls:
+                if not (isinstance(c, dict) and c.get("table_id") in self.table_by_id
+                        and is_int(c.get("from")) and is_int(c.get("to")) and c["from"] < c["to"]
+                        and isinstance(c.get("plan_id"), str)):
+                    raise Invalid("closure")
+                self.closures.append({"table_id": c["table_id"], "from": c["from"],
+                                      "to": c["to"], "plan_id": c["plan_id"]})
             pols = d.get("policies", [])
             if not isinstance(pols, list):
                 raise Invalid("policies")
@@ -412,6 +424,7 @@ class Rest:
         }
         if export:
             out["policies"] = [p.to_json(self.id) for p in self.policies]
+            out["closures"] = copy.deepcopy(self.closures)
         return out
 
     def policy_for(self, datestr):
@@ -452,9 +465,11 @@ class State:
         self.by_table = {}
         self.idem = {}
         self.series = {}
+        self.plans = {}
         self.n_res = 0
         self.n_user = 0
         self.n_series = 0
+        self.n_plan = 0
 
     def index_add(self, r):
         for t in r["tids"]:
@@ -482,6 +497,11 @@ class State:
             for x in self.by_table.get((rid, t), ()):
                 if x["status"] == "confirmed" and x["ref"] not in ignore \
                         and x["start"] < end and start < x["end"]:
+                    return True
+        rest = self.rests.get(rid)
+        if rest is not None:
+            for c in rest.closures:
+                if c["table_id"] in tids and c["from"] < end and start < c["to"]:
                     return True
         return False
 
@@ -624,12 +644,17 @@ def valid_hist(h):
     out = []
     for i, e in enumerate(h):
         if not (isinstance(e, dict) and e.get("seq") == i + 1 and is_int(e.get("seq"))
-                and isinstance(e.get("at"), str) and e.get("event") in ("created", "changed", "cancelled")
+                and isinstance(e.get("at"), str) and e.get("event") in ("created", "changed", "cancelled", "reassigned")
                 and isinstance(e.get("changes"), list) and is_int(e.get("revision"))):
             raise Invalid("history entry")
-        out.append({"seq": e["seq"], "at": e["at"], "event": e["event"],
-                    "changes": copy.deepcopy(e["changes"]), "revision": e["revision"],
-                    "accepted_terms": valid_terms(e.get("accepted_terms"))})
+        ent = {"seq": e["seq"], "at": e["at"], "event": e["event"],
+               "changes": copy.deepcopy(e["changes"]), "revision": e["revision"],
+               "accepted_terms": valid_terms(e.get("accepted_terms"))}
+        if e["event"] == "reassigned":
+            if not isinstance(e.get("plan_id"), str):
+                raise Invalid("history plan_id")
+            ent["plan_id"] = e["plan_id"]
+        out.append(ent)
     return out
 
 
@@ -906,11 +931,18 @@ async def h_export(req):
         "series": [{"id": x["id"], "user_id": x["user"], "restaurant_id": x["rid"],
                     "anchor_reference": x["anchor"], "count": x["count"],
                     "interval_weeks": x["interval"], "revision": x["rev"],
-                    "references": list(x["refs"]), "exceptions": list(x["exc"])}
+                    "references": list(x["refs"]), "exceptions": list(x["exc"]),
+                    "dates": list(x["dates"])}
                    for x in S.series.values()],
-        "counters": {"reservation": S.n_res, "user": S.n_user, "series": S.n_series},
+        "plans": [{"id": p["id"], "restaurant_id": p["rid"], "table_id": p["table_id"],
+                   "from": p["from"], "to": p["to"],
+                   "assignments": [{"reference": a, "table_ids": list(t)} for a, t in p["assign"]],
+                   "restaurant_revision": p["rev"], "applied": p["applied"]}
+                  for p in S.plans.values()],
+        "counters": {"reservation": S.n_res, "user": S.n_user, "series": S.n_series,
+                     "plan": S.n_plan},
         "references": sorted(S.res.keys()),
-        "schema": 3,
+        "schema": 4,
     }
     return 200, {"track": "tablekeeper", "format_version": 1, "state": st}
 
@@ -927,7 +959,7 @@ def build_import(body):
     if has_surrogate(st):
         raise Invalid("surrogate")
     schema = st.get("schema")
-    if "schema" in st and not (is_int(schema) and schema in (2, 3)):
+    if "schema" in st and not (is_int(schema) and schema in (1, 2, 3, 4)):
         raise Invalid("schema")
     for k in ("users", "restaurants", "reservations", "idempotency"):
         if not isinstance(st.get(k), list):
@@ -940,7 +972,8 @@ def build_import(body):
             or counters["user"] < 0:
         raise Invalid("counters")
     n_series = counters.get("series", 0)
-    if not (is_int(n_series) and n_series >= 0):
+    n_plan = counters.get("plan", 0)
+    if not (is_int(n_series) and n_series >= 0 and is_int(n_plan) and n_plan >= 0):
         raise Invalid("counters")
     new = State()
     for _, _, _, u in build_users_meta(st["users"]):
@@ -985,16 +1018,56 @@ def build_import(body):
             rr = new.res.get(ref) if isinstance(ref, str) else None
             if rr is None or rr["series"] != sid or rr["idx"] != i:
                 raise Invalid("series link")
+        iv = x["interval_weeks"]
+        dates = x.get("dates")
+        if dates is None:
+            # schema 3: derive scheduled dates from occurrence 1's created entry
+            ch = new.res[refs[1]]["hist"][0]["changes"]
+            first = [c["to"] for c in ch if c.get("field") == "starts_at_local"]
+            if not first or not isinstance(first[0], str):
+                raise Invalid("series dates")
+            m1 = LOCAL_RE.fullmatch(first[0])
+            if not m1 or not 1 <= iv <= 4:
+                raise Invalid("series dates")
+            d1 = dt.date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
+            dates = [(d1 + dt.timedelta(days=(i - 1) * iv * 7)).isoformat() for i in range(len(refs))]
+        elif not (isinstance(dates, list) and len(dates) == len(refs)
+                  and all(isinstance(q, str) and DATE_RE.fullmatch(q) for q in dates)):
+            raise Invalid("series dates")
         new.series[sid] = {"id": sid, "user": x["user_id"], "rid": x["restaurant_id"],
                            "anchor": x["anchor_reference"], "count": x["count"],
-                           "interval": x["interval_weeks"], "rev": x["revision"],
-                           "refs": list(refs), "exc": list(exc)}
+                           "interval": iv, "rev": x["revision"],
+                           "refs": list(refs), "exc": list(exc), "dates": list(dates)}
     for rr in new.res.values():
         if rr["series"] is not None and rr["series"] not in new.series:
             raise Invalid("series link")
     new.n_res = max(new.n_res, counters["reservation"])
     new.n_user = counters["user"]
     new.n_series = n_series
+    plans = st.get("plans", [])
+    if not isinstance(plans, list):
+        raise Invalid("plans")
+    for x in plans:
+        if not isinstance(x, dict):
+            raise Invalid("plan")
+        rr = new.rests.get(x.get("restaurant_id")) if isinstance(x.get("restaurant_id"), str) else None
+        asg = x.get("assignments")
+        if not (isinstance(x.get("id"), str) and rr is not None and x.get("table_id") in rr.table_by_id
+                and is_int(x.get("from")) and is_int(x.get("to")) and x["from"] < x["to"]
+                and isinstance(asg, list) and is_int(x.get("restaurant_revision"))
+                and isinstance(x.get("applied"), bool) and x["id"] not in new.plans):
+            raise Invalid("plan")
+        assign = []
+        for a in asg:
+            if not (isinstance(a, dict) and a.get("reference") in new.res
+                    and isinstance(a.get("table_ids"), list) and a["table_ids"]
+                    and all(t in rr.table_by_id for t in a["table_ids"])):
+                raise Invalid("plan assignment")
+            assign.append((a["reference"], list(a["table_ids"])))
+        new.plans[x["id"]] = {"id": x["id"], "rid": rr.id, "table_id": x["table_id"],
+                              "from": x["from"], "to": x["to"], "assign": assign,
+                              "rev": x["restaurant_revision"], "applied": x["applied"]}
+    new.n_plan = n_plan
     return new
 
 
@@ -1003,7 +1076,7 @@ async def h_import(req):
     body, _ = parse_obj(req)
     try:
         new = build_import(body)
-    except (Invalid, RecursionError, OverflowError, ValueError, TypeError, KeyError):
+    except Exception:
         raise err(422, "validation_failed", "invalid export")
     S = new
     return 204, None
@@ -1145,31 +1218,15 @@ def type_check_strings(body, names):
             raise err(400, "malformed_request", "%s must be a string" % k)
 
 
-def hist_add(r, event, changes, at=None):
+def hist_add(r, event, changes, at=None, extra=None):
     tz = S.rests[r["rid"]].tz
-    r["hist"].append({"seq": len(r["hist"]) + 1,
-                      "at": fmt_epoch(int(time.time()) if at is None else at, tz),
-                      "event": event, "changes": changes, "revision": r["rev"],
-                      "accepted_terms": copy.deepcopy(r["terms"])})
-
-
-def make_res(user, rest, tids, party, local, start, pol):
-    now = int(time.time())
-    r = {"id": new_res_id(), "ref": new_ref(), "user": user["id"], "rid": rest.id,
-         "tids": list(tids), "party": party, "status": "confirmed",
-         "local": local, "start": start, "end": start + pol.dur * 60,
-         "cts": now, "rev": 1, "terms": pol.terms(), "hist": [], "series": None, "idx": None}
-    hist_add(r, "created", created_changes(r["tids"], local, party), at=now)
-    S.add_res(r)
-    return r
-
-
-def hist_add(r, event, changes, at=None):
-    tz = S.rests[r["rid"]].tz
-    r["hist"].append({"seq": len(r["hist"]) + 1,
-                      "at": fmt_epoch(int(time.time()) if at is None else at, tz),
-                      "event": event, "changes": changes, "revision": r["rev"],
-                      "accepted_terms": copy.deepcopy(r["terms"])})
+    e = {"seq": len(r["hist"]) + 1,
+         "at": fmt_epoch(int(time.time()) if at is None else at, tz),
+         "event": event, "changes": changes, "revision": r["rev"],
+         "accepted_terms": copy.deepcopy(r["terms"])}
+    if extra:
+        e.update(extra)
+    r["hist"].append(e)
 
 
 def make_res(user, rest, tids, party, local, start, pol):
@@ -1509,7 +1566,8 @@ async def h_series_create(req):
     anchor["idx"] = 0
     S.series[sid] = {"id": sid, "user": user["id"], "rid": rest.id, "anchor": anchor["ref"],
                      "count": count, "interval": iv, "rev": 1, "refs": refs,
-                     "exc": [False] * count}
+                     "exc": [False] * count,
+                     "dates": [(base + dt.timedelta(days=i * iv * 7)).isoformat() for i in range(count)]}
     rest.revision += 1
     resp = series_json(S.series[sid])
     S.idem[ik] = {"body": canon, "status": 201, "response": resp}
@@ -1525,6 +1583,260 @@ async def h_series_get(req):
     if sr is None or sr["user"] != user["id"]:
         raise err(404, "not_found", "no such series")
     return 200, series_json(sr)
+
+
+# ---------------------------------------------------------- series amend --
+
+async def h_series_amend(req):
+    user = auth(req)
+    body, canon = parse_obj(req)
+    ik, rec = idem_pre(req, user, canon)
+    if rec is not None:
+        return 200, rec["response"]
+    sr = S.series.get(req.params[0])
+    if sr is None or sr["user"] != user["id"]:
+        raise err(404, "not_found", "no such series")
+    er = body.get("expected_revision")
+    fi = body.get("from_index")
+    lt = body.get("local_time")
+    if not (is_int(er) and er >= 1):
+        raise err(422, "validation_failed", "expected_revision must be a positive integer")
+    if not (is_int(fi) and 0 <= fi <= sr["count"] - 1):
+        raise err(422, "validation_failed", "from_index out of range")
+    if not (isinstance(lt, str) and LOCAL_TIME_RE.fullmatch(lt)):
+        raise err(422, "validation_failed", "local_time must be HH:MM")
+    if er != sr["rev"]:
+        raise err(409, "stale_revision", "the series has changed")
+    rest = S.rests[sr["rid"]]
+    plans = []
+    for i in range(fi, sr["count"]):
+        r = S.res[sr["refs"][i]]
+        if r["status"] != "confirmed" or sr["exc"][i]:
+            continue
+        local = "%sT%s" % (sr["dates"][i], lt)
+        if local == r["local"]:
+            continue
+        cutoff_check(r)
+        parts = parse_local(local)
+        pol = rest.policy_for(date_of(parts))
+        start = pol.check_slot(rest.tz, parts)
+        if r["party"] > pol.capacity(r["tids"]):
+            raise err(422, "party_exceeds_capacity")
+        plans.append((r, {"noop": False, "tids": list(r["tids"]), "local": local, "party": r["party"],
+                          "start": start, "end": start + pol.dur * 60, "terms": pol.terms()}))
+    changing = {r["ref"] for r, _ in plans}
+    for i, (ra, a) in enumerate(plans):
+        for rb, b in plans[i + 1:]:
+            if set(a["tids"]) & set(b["tids"]) and a["start"] < b["end"] and b["start"] < a["end"]:
+                raise err(409, "table_unavailable")
+        if S.conflict(ra["rid"], a["tids"], a["start"], a["end"], changing):
+            raise err(409, "table_unavailable")
+    for r, p in plans:
+        apply_plan(r, p)
+    if plans:
+        sr["rev"] += 1
+        rest.revision += 1
+    resp = series_json(sr)
+    S.idem[ik] = {"body": canon, "status": 201, "response": resp}
+    return 201, copy.deepcopy(resp)
+
+
+# --------------------------------------------------------------- replans --
+
+INSTANT_RE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2})"
+                        r"(?::([0-9]{2})(?:\.[0-9]+)?)?([Zz]|[+-][0-9]{2}:[0-9]{2})")
+
+
+def parse_instant(v, tz):
+    def bad(msg):
+        return err(422, "validation_failed", msg)
+    m = INSTANT_RE.fullmatch(v) if isinstance(v, str) else None
+    if not m:
+        raise bad("instants need an explicit offset, e.g. 2026-09-28T18:00:00+02:00")
+    y, mo, d, h, mi = (int(m.group(i)) for i in range(1, 6))
+    sec = int(m.group(6) or 0)
+    off = m.group(7)
+    if off in ("Z", "z"):
+        offs = 0
+    else:
+        oh, om = int(off[1:3]), int(off[4:6])
+        if oh > 23 or om > 59:
+            raise bad("bad offset")
+        offs = (oh * 3600 + om * 60) * (1 if off[0] == "+" else -1)
+    try:
+        dt.datetime(y, mo, d, h, mi, sec)
+    except ValueError:
+        raise bad("not a valid instant")
+    e = calendar.timegm((y, mo, d, h, mi, sec)) - offs
+    try:
+        loc = to_local(e, tz)
+    except (Unrep, OverflowError, ValueError):
+        raise bad("instant out of range")
+    if int(loc.utcoffset().total_seconds()) % 60:
+        raise bad("instant has a non-minute UTC offset in the restaurant timezone")
+    return e
+
+
+def solve_plan(rest, considered, closed_tid, fixed):
+    """Exact minimiser of (moved, unused seats, rank vector). None if infeasible."""
+    opts = [(t["id"],) for t in rest.tables] + [tuple(p) for p in rest.combinable]
+    n = len(considered)
+    cand = []
+    for b in considered:
+        caps = b["terms"]["capacities"]
+        lst = []
+        for rank, opt in enumerate(opts):
+            if closed_tid in opt:
+                continue
+            cap = sum(caps.get(t, 0) for t in opt)
+            if cap < b["party"]:
+                continue
+            if any(c["table_id"] in opt and c["from"] < b["end"] and b["start"] < c["to"]
+                   for c in rest.closures):
+                continue
+            if any(set(f["tids"]) & set(opt) and f["start"] < b["end"] and b["start"] < f["end"]
+                   for f in fixed):
+                continue
+            lst.append((0 if list(opt) == b["tids"] else 1, cap - b["party"], rank, opt))
+        if not lst:
+            return None
+        lst.sort()
+        cand.append(lst)
+    ov = [[considered[i]["start"] < considered[j]["end"] and considered[j]["start"] < considered[i]["end"]
+           for j in range(n)] for i in range(n)]
+    minc = [0] * (n + 1)
+    minu = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        minc[i] = minc[i + 1] + min(x[0] for x in cand[i])
+        minu[i] = minu[i + 1] + min(x[1] for x in cand[i])
+    best = [None]
+    chosen = [None] * n
+    ranks = [0] * n
+    deadline = time.time() + 4.0
+
+    def dfs(i, moved, unused):
+        if time.time() > deadline:
+            raise TimeoutError()
+        if i == n:
+            key = (moved, unused, tuple(ranks))
+            if best[0] is None or key < best[0][0]:
+                best[0] = (key, list(chosen))
+            return
+        if best[0] is not None:
+            bm, bu, br = best[0][0]
+            lm, lu = moved + minc[i], unused + minu[i]
+            if lm > bm or (lm == bm and lu > bu):
+                return
+            if lm == bm and lu == bu and tuple(ranks[:i]) > br[:i]:
+                return
+        for ch, un, rank, opt in cand[i]:
+            if any(ov[j][i] and set(chosen[j]) & set(opt) for j in range(i)):
+                continue
+            chosen[i] = opt
+            ranks[i] = rank
+            dfs(i + 1, moved + ch, unused + un)
+        chosen[i] = None
+
+    try:
+        dfs(0, 0, 0)
+    except TimeoutError:
+        raise err(422, "planning_limit", "the plan is too large to solve")
+    if best[0] is None:
+        return None
+    key, ch = best[0]
+    return key[0], key[1], [list(c) for c in ch]
+
+
+async def h_replan(req):
+    user = auth(req)
+    body, canon = parse_obj(req)
+    ik, rec = idem_pre(req, user, canon)
+    if rec is not None:
+        return 200, rec["response"]
+    rest = S.rests.get(req.params[0])
+    if rest is None:
+        raise err(404, "not_found", "no such restaurant")
+    if user["id"] not in rest.managers:
+        raise err(403, "forbidden", "only managers may plan seating changes")
+    tid = body.get("table_id")
+    if not isinstance(tid, str):
+        raise err(422, "validation_failed", "table_id is required")
+    frm = parse_instant(body.get("from"), rest.tz)
+    to = parse_instant(body.get("to"), rest.tz)
+    if not frm < to:
+        raise err(422, "validation_failed", "from must be before to")
+    if tid not in rest.table_by_id:
+        raise err(404, "not_found", "no such table")
+    confirmed = [r for r in S.res.values() if r["rid"] == rest.id and r["status"] == "confirmed"]
+    considered = sorted((r for r in confirmed if r["start"] < to and frm < r["end"]), key=lambda r: r["ref"])
+    if len(considered) > 8 or len(rest.tables) + len(rest.combinable) > 12:
+        raise err(422, "planning_limit", "too many bookings or tables to plan")
+    cons_refs = {r["ref"] for r in considered}
+    fixed = [r for r in confirmed if r["ref"] not in cons_refs]
+    sol = solve_plan(rest, considered, tid, fixed)
+    if sol is None:
+        raise err(409, "no_feasible_plan", "no seating arrangement can keep every booking")
+    moved, unused, assign = sol
+    n = S.n_plan + 1
+    while "plan_%d" % n in S.plans:
+        n += 1
+    pid = "plan_%d" % n
+    resp = {"plan_id": pid, "restaurant_revision": rest.revision,
+            "closure": {"table_id": tid, "from": fmt_epoch(frm, rest.tz), "to": fmt_epoch(to, rest.tz)},
+            "assignments": [{"reference": r["ref"], "table_ids": list(a), "changed": list(a) != r["tids"]}
+                            for r, a in zip(considered, assign)],
+            "moved_count": moved, "unused_seats": unused}
+    S.n_plan = n
+    S.plans[pid] = {"id": pid, "rid": rest.id, "table_id": tid, "from": frm, "to": to,
+                    "assign": [(r["ref"], list(a)) for r, a in zip(considered, assign)],
+                    "rev": rest.revision, "applied": False}
+    S.idem[ik] = {"body": canon, "status": 201, "response": resp}
+    return 201, copy.deepcopy(resp)
+
+
+async def h_replan_apply(req):
+    user = auth(req)
+    body, canon = parse_obj(req)
+    ik, rec = idem_pre(req, user, canon)
+    if rec is not None:
+        return 200, rec["response"]
+    rest = S.rests.get(req.params[0])
+    if rest is None:
+        raise err(404, "not_found", "no such restaurant")
+    if user["id"] not in rest.managers:
+        raise err(403, "forbidden", "only managers may apply seating plans")
+    plan = S.plans.get(req.params[1])
+    if plan is None or plan["rid"] != rest.id:
+        raise err(404, "not_found", "no such plan")
+    if plan["applied"]:
+        raise err(409, "plan_already_applied", "this plan was already applied")
+    if plan["rev"] != rest.revision:
+        raise err(409, "stale_plan", "the restaurant changed since the plan was proposed")
+    touched = set()
+    rs = []
+    for ref, tids in plan["assign"]:
+        r = S.res[ref]
+        rs.append(r)
+        if r["tids"] != tids:
+            old = list(r["tids"])
+            S.index_remove(r)
+            r["tids"] = list(tids)
+            S.index_add(r)
+            r["rev"] += 1
+            hist_add(r, "reassigned", [{"field": "table_ids", "from": old, "to": list(tids)}],
+                     extra={"plan_id": plan["id"]})
+            if r["series"] is not None and r["series"] in S.series:
+                touched.add(r["series"])
+    for sid in touched:
+        S.series[sid]["rev"] += 1
+    rest.closures.append({"table_id": plan["table_id"], "from": plan["from"], "to": plan["to"],
+                          "plan_id": plan["id"]})
+    rest.revision += 1
+    plan["applied"] = True
+    resp = {"plan_id": plan["id"], "restaurant_revision": rest.revision,
+            "reservations": [res_json(r) for r in rs]}
+    S.idem[ik] = {"body": canon, "status": 201, "response": resp}
+    return 201, copy.deepcopy(resp)
 
 
 class Raw:
@@ -1575,6 +1887,9 @@ ROUTES = [
     (re.compile(r"/reservations/([^/]+)/decision"), {"GET": h_decision}),
     (re.compile(r"/reservation-moves"), {"POST": h_moves}),
     (re.compile(r"/restaurants/([^/]+)/policies"), {"POST": h_policy_post, "GET": h_policy_list}),
+    (re.compile(r"/restaurants/([^/]+)/replans"), {"POST": h_replan}),
+    (re.compile(r"/restaurants/([^/]+)/replans/([^/]+)/apply"), {"POST": h_replan_apply}),
+    (re.compile(r"/series/([^/]+)/amend"), {"POST": h_series_amend}),
     (re.compile(r"/series"), {"POST": h_series_create}),
     (re.compile(r"/series/([^/]+)"), {"GET": h_series_get}),
 ]
