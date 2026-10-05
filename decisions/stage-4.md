@@ -53,3 +53,6 @@ Deliverable: `stage-4/` in `/Users/chiraanths/Desktop/lockin/Band-hack/band-work
 - A series amend whose eligible set is empty or all no-op returns 201 and stores its idempotency receipt (it is a successful write), so a replay returns 200; no counters change.
 - Imported schema-4 plans whose assignments name unknown reservation references → 422 with no state change.
 - Restaurants imported from stage-1/2 exports have `manager_user_ids: []`, so replans there return 403 (as G8).
+
+## Status
+- Stage 4 ACCEPTED at d6266e7: review r1 ACCEPT (no defects; independent brute force 420 cases, 0 mismatches), release-verifier r1 ACCEPT (harness isolated: stage-1 120/120, stage-2 25/25, stage-3 7/7, stage-4 6/6, claimed stage 4; `--all`: stage-1/2/3/4 claim 1/2/3/4; reports checks/graded-s4-release-r1-1 and -all).
