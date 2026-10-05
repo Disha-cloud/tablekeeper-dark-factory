@@ -11,6 +11,11 @@ The service was built in four stages. Each stage is a complete, independently bu
 folder (`stage-1/` … `stage-4/`), and every stage includes everything before it. A four-seat
 agent factory produced all the code (see [FACTORY.md](FACTORY.md)).
 
+## Presentation
+
+- [Presentation slides](https://drive.google.com/file/d/1ep1vJUw_nLvg-NmDnZ1Hw8Xb0EB_yn6d/view?usp=sharing)
+- [Presentation and demo video](https://drive.google.com/file/d/1cjMDOAg_PpCGJWwZcF0THoYp4QxtEdTh/view?usp=sharing)
+
 ## Repository layout
 
 | Path | Contents |
