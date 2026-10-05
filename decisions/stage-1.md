@@ -99,3 +99,6 @@ These resolve points the spec leaves open. Where the spec is explicit, the spec 
 
 ## D14 Review r1 non-blocking notes (cf904c2 accepted by review)
 - Years below 1000 in response timestamps (`strftime("%Y")` not zero-padded; pre-1893 LMT offsets truncated to whole minutes) and JSON integers over Python's 4300-digit limit giving 400 instead of 422 are **deferred**: neither affects a spec-listed behaviour (the spec's DST dates and fixtures are 2026; no 5xx occurs). They are carried as known issues into the next stage that touches time formatting or body parsing and are not grounds for rejecting stage 1.
+
+## Status
+- Stage 1 ACCEPTED at cf904c2: review r1 ACCEPT, release-verifier r1 ACCEPT (harness isolated: 120/120 stage-1, claimed stage 1; report checks/graded-s1-release-r1-1/report.json).
