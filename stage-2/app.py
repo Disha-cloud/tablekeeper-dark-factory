@@ -17,11 +17,13 @@ import re
 import secrets
 import sys
 import time
+import os
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
+sys.set_int_max_str_digits(1000000)
 UTC = dt.timezone.utc
 EPOCH = dt.datetime(1970, 1, 1, tzinfo=UTC)
 MIN_E = -62135596800 + 3 * 86400
@@ -116,19 +118,23 @@ def closes_epoch(y, mo, d, h, mi, tz):
 
 
 def fmt_offset(dtv):
-    secs = int(dtv.utcoffset().total_seconds())
+    secs = int(round(dtv.utcoffset().total_seconds() / 60.0)) * 60
     sign = "+" if secs >= 0 else "-"
     secs = abs(secs)
     return "%s%02d:%02d" % (sign, secs // 3600, (secs % 3600) // 60)
 
 
+def fmt_dt(d):
+    return "%04d-%02d-%02dT%02d:%02d:%02d" % (d.year, d.month, d.day, d.hour, d.minute, d.second)
+
+
 def fmt_epoch(e, tz):
     d = to_local(e, tz)
-    return d.strftime("%Y-%m-%dT%H:%M:%S") + fmt_offset(d)
+    return fmt_dt(d) + fmt_offset(d)
 
 
 def fmt_utc(e):
-    return to_local(e, UTC).strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"
+    return fmt_dt(to_local(e, UTC)) + "+00:00"
 
 
 def parse_local(s):
@@ -221,6 +227,21 @@ class Rest:
             tab = {"id": tid, "label": label, "capacity": cap}
             self.tables.append(tab)
             self.table_by_id[tid] = tab
+        comb = d.get("combinable", [])
+        if not isinstance(comb, list):
+            raise Invalid("combinable")
+        self.combinable = []
+        self.pairs = {}
+        for p in comb:
+            if not (isinstance(p, list) and len(p) == 2 and isinstance(p[0], str)
+                    and isinstance(p[1], str) and p[0] != p[1]
+                    and p[0] in self.table_by_id and p[1] in self.table_by_id):
+                raise Invalid("combinable pair")
+            key = frozenset(p)
+            if key in self.pairs:
+                raise Invalid("duplicate pair")
+            self.pairs[key] = [p[0], p[1]]
+            self.combinable.append([p[0], p[1]])
 
     def to_json(self):
         return {
@@ -230,7 +251,24 @@ class Rest:
             "cancellation_cutoff_minutes": self.cutoff,
             "opening_hours": copy.deepcopy(self.hours),
             "tables": copy.deepcopy(self.tables),
+            "combinable": copy.deepcopy(self.combinable),
         }
+
+    def resolve(self, ids):
+        """Table-selection steps 4-5: unknown ids -> 404, undeclared pair -> 422.
+        Returns the ids in canonical (declared) order."""
+        for t in ids:
+            if t not in self.table_by_id:
+                raise err(404, "not_found", "no such table")
+        if len(ids) == 2:
+            pair = self.pairs.get(frozenset(ids))
+            if pair is None:
+                raise err(422, "combination_not_allowed", "these tables cannot be combined")
+            return list(pair)
+        return list(ids)
+
+    def capacity(self, ids):
+        return sum(self.table_by_id[t]["capacity"] for t in ids)
 
     def check_slot(self, parts):
         """Rule chain D5 up to (not including) capacity. Returns start epoch."""
@@ -299,15 +337,17 @@ class State:
         self.n_user = 0
 
     def index_add(self, r):
-        self.by_table.setdefault((r["rid"], r["tid"]), []).append(r)
+        for t in r["tids"]:
+            self.by_table.setdefault((r["rid"], t), []).append(r)
 
     def index_remove(self, r):
-        lst = self.by_table.get((r["rid"], r["tid"]))
-        if lst is not None:
-            for i, x in enumerate(lst):
-                if x is r:
-                    del lst[i]
-                    break
+        for t in r["tids"]:
+            lst = self.by_table.get((r["rid"], t))
+            if lst is not None:
+                for i, x in enumerate(lst):
+                    if x is r:
+                        del lst[i]
+                        break
 
     def add_res(self, r):
         self.res[r["ref"]] = r
@@ -317,11 +357,12 @@ class State:
         if m:
             self.n_res = max(self.n_res, int(m.group(1)))
 
-    def conflict(self, rid, tid, start, end, ignore):
-        for x in self.by_table.get((rid, tid), ()):
-            if x["status"] == "confirmed" and x["ref"] not in ignore \
-                    and x["start"] < end and start < x["end"]:
-                return True
+    def conflict(self, rid, tids, start, end, ignore):
+        for t in tids:
+            for x in self.by_table.get((rid, t), ()):
+                if x["status"] == "confirmed" and x["ref"] not in ignore \
+                        and x["start"] < end and start < x["end"]:
+                    return True
         return False
 
 
@@ -392,6 +433,38 @@ def parse_created(v):
     return e
 
 
+def shape_ids(ids):
+    """Table-selection step 3 (body-only checks)."""
+    if not ids:
+        raise err(422, "validation_failed", "table_ids must not be empty")
+    if len(set(ids)) != len(ids):
+        raise err(422, "validation_failed", "duplicate table ids")
+    if len(ids) > 2:
+        raise err(422, "combination_not_allowed", "at most two tables can be combined")
+    for t in ids:
+        check_id_len(t)
+
+
+def sel_type_checks(body):
+    """Table-selection steps 1-2."""
+    if "table_id" in body and "table_ids" in body:
+        raise err(422, "validation_failed", "send table_id or table_ids, not both")
+    if "table_id" in body and not isinstance(body["table_id"], str):
+        raise err(400, "malformed_request", "table_id must be a string")
+    if "table_ids" in body:
+        t = body["table_ids"]
+        if not isinstance(t, list) or not all(isinstance(x, str) for x in t):
+            raise err(400, "malformed_request", "table_ids must be an array of strings")
+
+
+def sel_ids(body):
+    if "table_ids" in body:
+        return list(body["table_ids"])
+    if "table_id" in body:
+        return [body["table_id"]]
+    return None
+
+
 def build_res(d, rests):
     if not isinstance(d, dict):
         raise Invalid("reservation")
@@ -401,10 +474,17 @@ def build_res(d, rests):
         raise Invalid("reference")
     user = v_id(d.get("user_id"))
     rid = d.get("restaurant_id")
-    tid = d.get("table_id")
     rest = rests.get(rid) if isinstance(rid, str) else None
-    if rest is None or not isinstance(tid, str) or tid not in rest.table_by_id:
+    if rest is None or ("table_id" in d and "table_ids" in d):
         raise Invalid("restaurant/table")
+    ids = d.get("table_ids") if "table_ids" in d else [d.get("table_id")]
+    if not isinstance(ids, list) or not ids or not all(isinstance(t, str) for t in ids):
+        raise Invalid("tables")
+    try:
+        shape_ids(ids)
+        tids = rest.resolve(ids)
+    except ApiError:
+        raise Invalid("tables")
     party = d.get("party_size")
     if not (is_int(party) and party >= 1):
         raise Invalid("party_size")
@@ -427,26 +507,29 @@ def build_res(d, rests):
     if end > MAX_E:
         raise Invalid("end not representable")
     cts = parse_created(d.get("created_at"))
-    return {"id": rid_, "ref": ref, "user": user, "rid": rid, "tid": tid,
+    return {"id": rid_, "ref": ref, "user": user, "rid": rid, "tids": tids,
             "party": party, "status": status, "local": local, "start": e,
             "end": end, "cts": cts}
 
 
 def res_export(r):
     return {"id": r["id"], "reference": r["ref"], "user_id": r["user"],
-            "restaurant_id": r["rid"], "table_id": r["tid"], "party_size": r["party"],
+            "restaurant_id": r["rid"], "table_ids": list(r["tids"]), "party_size": r["party"],
             "status": r["status"], "starts_at_local": r["local"],
             "created_at": fmt_utc(r["cts"])}
 
 
 def res_json(r):
     tz = S.rests[r["rid"]].tz
-    return {
+    out = {
         "reservation_id": r["id"], "reference": r["ref"], "restaurant_id": r["rid"],
-        "table_id": r["tid"], "party_size": r["party"], "status": r["status"],
+        "table_ids": list(r["tids"]), "party_size": r["party"], "status": r["status"],
         "starts_at_local": r["local"], "starts_at": fmt_epoch(r["start"], tz),
         "ends_at": fmt_epoch(r["end"], tz), "created_at": fmt_utc(r["cts"]),
     }
+    if len(r["tids"]) == 1:
+        out["table_id"] = r["tids"][0]
+    return out
 
 
 def build_rests_and_res(rest_list, res_list):
@@ -630,6 +713,7 @@ async def h_export(req):
             for k, v in S.idem.items()],
         "counters": {"reservation": S.n_res, "user": S.n_user},
         "references": sorted(S.res.keys()),
+        "schema": 2,
     }
     return 200, {"track": "tablekeeper", "format_version": 1, "state": st}
 
@@ -645,6 +729,8 @@ def build_import(body):
         raise Invalid("state")
     if has_surrogate(st):
         raise Invalid("surrogate")
+    if "schema" in st and not (is_int(st["schema"]) and st["schema"] == 2):
+        raise Invalid("schema")
     for k in ("users", "restaurants", "reservations", "idempotency"):
         if not isinstance(st.get(k), list):
             raise Invalid(k)
@@ -776,7 +862,7 @@ async def h_availability(req):
         if q.get(k, "") == "":
             raise err(422, "validation_failed", "%s is required" % k)
     ps = q["party_size"]
-    if not DIGITS_RE.fullmatch(ps) or len(ps) > 4000 or int(ps) < 1:
+    if not DIGITS_RE.fullmatch(ps) or len(ps) > 100000 or int(ps) < 1:
         raise err(422, "validation_failed", "party_size must be a positive integer")
     m = DATE_RE.fullmatch(q["date"])
     if not m:
@@ -793,10 +879,19 @@ async def h_availability(req):
     slots = []
     for m_, e in rest.slots(y, mo, d):
         end = e + rest.dur * 60
+        free = {t["id"] for t in rest.tables
+                if not S.conflict(rest.id, (t["id"],), e, end, ())}
         avail = [t["id"] for t in rest.tables
-                 if t["capacity"] >= party and not S.conflict(rest.id, t["id"], e, end, ())]
+                 if t["capacity"] >= party and t["id"] in free]
+        options = [{"table_ids": [t["id"]], "capacity": t["capacity"]} for t in rest.tables
+                   if t["capacity"] >= party and t["id"] in free]
+        for pair in rest.combinable:
+            cap = rest.capacity(pair)
+            if cap >= party and pair[0] in free and pair[1] in free:
+                options.append({"table_ids": list(pair), "capacity": cap})
         slots.append({"starts_at_local": "%04d-%02d-%02dT%02d:%02d" % (y, mo, d, m_ // 60, m_ % 60),
-                      "starts_at": fmt_epoch(e, rest.tz), "available_table_ids": avail})
+                      "starts_at": fmt_epoch(e, rest.tz), "available_table_ids": avail,
+                      "available_options": options})
     return 200, {"restaurant_id": rest.id, "date": q["date"], "timezone": rest.timezone,
                  "slots": slots}
 
@@ -813,30 +908,32 @@ async def h_create(req):
     ik, rec = idem_pre(req, user, canon)
     if rec is not None:
         return 200, rec["response"]
-    names = ("restaurant_id", "table_id", "starts_at_local")
+    names = ("restaurant_id", "starts_at_local")
     type_check_strings(body, names)
+    sel_type_checks(body)
     for k in names + ("party_size",):
         if k not in body:
             raise err(422, "validation_failed", "%s is required" % k)
+    ids = sel_ids(body)
+    if ids is None:
+        raise err(422, "validation_failed", "table_id or table_ids is required")
     check_party(body["party_size"])
     parts = parse_local(body["starts_at_local"])
     check_id_len(body["restaurant_id"])
-    check_id_len(body["table_id"])
+    shape_ids(ids)
     rest = S.rests.get(body["restaurant_id"])
     if rest is None:
         raise err(404, "not_found", "no such restaurant")
-    table = rest.table_by_id.get(body["table_id"])
-    if table is None:
-        raise err(404, "not_found", "no such table")
+    tids = rest.resolve(ids)
     start = rest.check_slot(parts)
     party = body["party_size"]
-    if party > table["capacity"]:
+    if party > rest.capacity(tids):
         raise err(422, "party_exceeds_capacity")
     end = start + rest.dur * 60
-    if S.conflict(rest.id, table["id"], start, end, ()):
+    if S.conflict(rest.id, tids, start, end, ()):
         raise err(409, "table_unavailable")
     r = {"id": new_res_id(), "ref": new_ref(), "user": user["id"], "rid": rest.id,
-         "tid": table["id"], "party": party, "status": "confirmed",
+         "tids": tids, "party": party, "status": "confirmed",
          "local": body["starts_at_local"], "start": start, "end": end,
          "cts": int(time.time())}
     S.add_res(r)
@@ -878,36 +975,40 @@ async def h_cancel(req):
 
 def plan_amend(r, body, types_first):
     rest = S.rests[r["rid"]]
-    names = ("table_id", "starts_at_local")
+
+    def types():
+        sel_type_checks(body)
+        type_check_strings(body, ("starts_at_local",))
     if types_first:
-        type_check_strings(body, names)
+        types()
     if r["status"] != "confirmed":
         raise err(409, "reservation_cancelled")
     cutoff_check(r, rest)
     if not types_first:
-        type_check_strings(body, names)
+        types()
     party = r["party"]
     if "party_size" in body:
         check_party(body["party_size"])
         party = body["party_size"]
     local = body.get("starts_at_local", r["local"])
     parts = parse_local(local)
-    tid = body.get("table_id", r["tid"])
-    check_id_len(tid)
-    table = rest.table_by_id.get(tid)
-    if table is None:
-        raise err(404, "not_found", "no such table")
+    ids = sel_ids(body)
+    if ids is None:
+        ids = list(r["tids"])
+    else:
+        shape_ids(ids)
+    tids = rest.resolve(ids)
     start = rest.check_slot(parts)
-    if party > table["capacity"]:
+    if party > rest.capacity(tids):
         raise err(422, "party_exceeds_capacity")
-    return {"tid": tid, "local": local, "party": party, "start": start,
+    return {"tids": tids, "local": local, "party": party, "start": start,
             "end": start + rest.dur * 60}
 
 
 def apply_plan(r, p):
-    if p["tid"] != r["tid"]:
+    if p["tids"] != r["tids"]:
         S.index_remove(r)
-        r["tid"] = p["tid"]
+        r["tids"] = p["tids"]
         S.index_add(r)
     r["local"] = p["local"]
     r["party"] = p["party"]
@@ -920,7 +1021,7 @@ async def h_patch(req):
     r = own_res(user, req.params[0])
     body, _ = parse_obj(req)
     p = plan_amend(r, body, True)
-    if S.conflict(r["rid"], p["tid"], p["start"], p["end"], (r["ref"],)):
+    if S.conflict(r["rid"], p["tids"], p["start"], p["end"], (r["ref"],)):
         raise err(409, "table_unavailable")
     apply_plan(r, p)
     return 200, res_json(r)
@@ -951,9 +1052,9 @@ async def h_moves(req):
         ra = rs[i]
         for j in range(i + 1, len(plans)):
             b = plans[j]
-            if a["tid"] == b["tid"] and a["start"] < b["end"] and b["start"] < a["end"]:
+            if set(a["tids"]) & set(b["tids"]) and a["start"] < b["end"] and b["start"] < a["end"]:
                 raise err(409, "table_unavailable")
-        if S.conflict(ra["rid"], a["tid"], a["start"], a["end"], listed):
+        if S.conflict(ra["rid"], a["tids"], a["start"], a["end"], listed):
             raise err(409, "table_unavailable")
     for r, p in zip(rs, plans):
         apply_plan(r, p)
@@ -962,7 +1063,38 @@ async def h_moves(req):
     return 201, copy.deepcopy(resp)
 
 
+class Raw:
+    def __init__(self, body, ctype, cache="no-cache"):
+        self.body, self.ctype, self.cache = body, ctype, cache
+
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def load_static(name):
+    with open(os.path.join(STATIC_DIR, name), "rb") as f:
+        return f.read()
+
+
+SHELL = Raw(load_static("index.html"), "text/html; charset=utf-8")
+ASSETS = {
+    "/assets/app.js": Raw(load_static("app.js"), "text/javascript; charset=utf-8"),
+    "/assets/app.css": Raw(load_static("app.css"), "text/css; charset=utf-8"),
+    "/assets/favicon.svg": Raw(load_static("favicon.svg"), "image/svg+xml"),
+}
+
+
+async def h_shell(req):
+    return 200, SHELL
+
+
+async def h_asset(req):
+    return 200, ASSETS[req.path]
+
+
 ROUTES = [
+    (re.compile(r"/|/signup|/login|/lookup"), {"GET": h_shell}),
+    (re.compile(r"/assets/(?:app\.js|app\.css|favicon\.svg)"), {"GET": h_asset}),
     (re.compile(r"/health"), {"GET": h_health}),
     (re.compile(r"/_test/reset"), {"POST": h_reset}),
     (re.compile(r"/_test/export"), {"GET": h_export}),
@@ -1038,10 +1170,16 @@ async def app(scope, receive, send):
     if scope["type"] != "http":
         return
     extra = []
+    ctype = "application/json; charset=utf-8"
     try:
         req = await read_request(scope, receive)
         (status, payload), _ = await route(req)
-        body = b"" if payload is None else dumps(payload)
+        if isinstance(payload, Raw):
+            body = payload.body
+            ctype = payload.ctype
+            extra = [(b"cache-control", payload.cache.encode())]
+        else:
+            body = b"" if payload is None else dumps(payload)
     except ApiError as e:
         status, body = e.status, error_body(e.status, e.code, e.message)
         if status == 405:
@@ -1053,6 +1191,6 @@ async def app(scope, receive, send):
         status, body = 500, error_body(500, "internal_error", "internal error")
     headers = [(b"content-length", str(len(body)).encode())] + extra
     if status != 204:
-        headers.append((b"content-type", b"application/json; charset=utf-8"))
+        headers.append((b"content-type", ctype.encode()))
     await send({"type": "http.response.start", "status": status, "headers": headers})
     await send({"type": "http.response.body", "body": body})
