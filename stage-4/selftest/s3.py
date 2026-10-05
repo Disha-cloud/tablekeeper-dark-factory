@@ -582,7 +582,7 @@ def t_export_roundtrip():
     s, sr = call("POST", "/series", {"anchor_reference": a["reference"], "count": 3, "interval_weeks": 2}, t["ada"], H("XS"))
     call("PATCH", "/reservations/" + sr["occurrences"][1]["reference"], {"party_size": 3}, t["ada"])
     s, exp = call("GET", "/_test/export")
-    check("schema 3", exp["state"]["schema"] == 3)
+    check("schema 4", exp["state"]["schema"] == 4)
     expected = {
         "series": call("GET", "/series/" + sr["series_id"], token=t["ada"])[1],
         "hist": call("GET", "/reservations/%s/history" % a["reference"], token=t["ada"])[1],
