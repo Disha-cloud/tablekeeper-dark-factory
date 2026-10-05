@@ -417,6 +417,162 @@ def t_robust():
         check("edge avail no 5xx " + p[:60], s < 500, (s, js))
 
 
+def comb_fixture():
+    fx = fixture()
+    r = fx["restaurants"][0]
+    r["tables"] = [{"id": "t_1", "label": "1", "capacity": 2}, {"id": "t_2", "label": "2", "capacity": 4},
+                   {"id": "t_3", "label": "3", "capacity": 4}]
+    r["combinable"] = [["t_1", "t_2"], ["t_2", "t_3"]]
+    return fx
+
+
+def bk(tok, ids, local="2099-09-24T19:00", party=6, key=None, extra=None):
+    b = {"restaurant_id": "r_anker", "table_ids": ids, "starts_at_local": local, "party_size": party}
+    b.update(extra or {})
+    return call("POST", "/reservations", b, tok, {"Idempotency-Key": key or uuid.uuid4().hex})
+
+
+def t_combined():
+    expect("combo reset", reset(comb_fixture()), 204)
+    tok, _ = signup()
+    s, js = call("GET", "/restaurants/r_anker")
+    check("restaurant combinable", js["combinable"] == [["t_1", "t_2"], ["t_2", "t_3"]], js)
+    s, js = call("GET", "/availability?restaurant_id=r_anker&date=2099-09-24&party_size=5")
+    o = js["slots"][0]["available_options"]
+    check("options pairs only for 5", [x["table_ids"] for x in o] == [["t_1", "t_2"], ["t_2", "t_3"]] and o[0]["capacity"] == 6, o)
+    check("available_table_ids singles unchanged", js["slots"][0]["available_table_ids"] == [] , js["slots"][0])
+    s, js = call("GET", "/availability?restaurant_id=r_anker&date=2099-09-24&party_size=2")
+    o = js["slots"][0]["available_options"]
+    check("options singles then pairs", [x["table_ids"] for x in o] == [["t_1"], ["t_2"], ["t_3"], ["t_1", "t_2"], ["t_2", "t_3"]], o)
+    s, js = bk(tok, ["t_2", "t_1"])
+    check("pair booking", s == 201 and js["table_ids"] == ["t_1", "t_2"] and "table_id" not in js, js)
+    ref = js["reference"]
+    s, js2 = book(tok, "2099-09-24T19:00", "t_3", 2)
+    check("single response has both", s == 201 and js2["table_id"] == "t_3" and js2["table_ids"] == ["t_3"], js2)
+    expect("member taken", book(tok, "2099-09-24T20:00", "t_1", 2), 409, "table_unavailable")
+    expect("member taken by pair", bk(tok, ["t_2", "t_3"], "2099-09-24T19:30"), 409, "table_unavailable")
+    s, js = call("GET", "/availability?restaurant_id=r_anker&date=2099-09-24&party_size=1")
+    sl = js["slots"][2]
+    check("pair occupies members", sl["available_table_ids"] == [] and sl["available_options"] == [], sl)
+    # validation order
+    expect("both fields", bk(tok, ["t_1"], extra={"table_id": "t_1"}), 422, "validation_failed")
+    expect("ids not array", call("POST", "/reservations", {"restaurant_id": "r_anker", "table_ids": "t_1", "starts_at_local": "2099-09-25T19:00", "party_size": 1}, tok, {"Idempotency-Key": "a1"}), 400, "malformed_request")
+    expect("ids elem type", bk(tok, ["t_1", 2], "2099-09-25T19:00"), 400, "malformed_request")
+    expect("ids empty", bk(tok, [], "2099-09-25T19:00"), 422, "validation_failed")
+    expect("ids dup", bk(tok, ["t_1", "t_1"], "2099-09-25T19:00"), 422, "validation_failed")
+    expect("ids three", bk(tok, ["t_1", "t_2", "t_3"], "2099-09-25T19:00"), 422, "combination_not_allowed")
+    expect("ids unknown", bk(tok, ["t_1", "zz"], "2099-09-25T19:00"), 404, "not_found")
+    expect("not declared", bk(tok, ["t_1", "t_3"], "2099-09-25T19:00"), 422, "combination_not_allowed")
+    expect("pair capacity", bk(tok, ["t_1", "t_2"], "2099-09-25T19:00", 7), 422, "party_exceeds_capacity")
+    expect("pair grid", bk(tok, ["t_1", "t_2"], "2099-09-25T19:10", 3), 422, "not_on_slot_grid")
+    expect("pair outside", bk(tok, ["t_1", "t_2"], "2099-09-25T22:30", 3), 422, "outside_opening_hours")
+    expect("combo idem", bk(tok, ["t_2", "t_3"], "2099-09-26T19:00", 5, key="CK"), 201)
+    s, j = bk(tok, ["t_2", "t_3"], "2099-09-26T19:00", 5, key="CK")
+    check("combo replay", s == 200 and j["table_ids"] == ["t_2", "t_3"], j)
+    # patch
+    s, js = call("PATCH", "/reservations/" + ref, {"table_ids": ["t_2", "t_3"]}, tok)
+    check("patch to other pair conflicts (t_3 busy)", s == 409, (s, js))
+    s, js = call("PATCH", "/reservations/" + ref, {"table_id": "t_1", "party_size": 2}, tok)
+    check("patch pair->single", s == 200 and js["table_id"] == "t_1" and js["table_ids"] == ["t_1"], js)
+    s, js = call("PATCH", "/reservations/" + ref, {"table_ids": ["t_1", "t_2"], "party_size": 6}, tok)
+    check("patch single->pair", s == 200 and "table_id" not in js and js["table_ids"] == ["t_1", "t_2"], js)
+    expect("patch both", call("PATCH", "/reservations/" + ref, {"table_id": "t_1", "table_ids": ["t_1"]}, tok), 422, "validation_failed")
+    expect("patch bad pair", call("PATCH", "/reservations/" + ref, {"table_ids": ["t_1", "t_3"]}, tok), 422, "combination_not_allowed")
+    s, js = call("POST", "/reservations/%s/cancel" % ref, token=tok)
+    check("cancel pair", s == 200 and js["status"] == "cancelled", js)
+    s, js = call("GET", "/availability?restaurant_id=r_anker&date=2099-09-24&party_size=5")
+    check("cancel frees pair", [1 for x in js["slots"][2]["available_options"] if x["table_ids"] == ["t_1", "t_2"]] != [], js["slots"][2])
+    # moves with table_ids
+    reset(comb_fixture())
+    tok, _ = signup()
+    a = book(tok, "2099-09-24T19:00", "t_1", 2)[1]["reference"]
+    b = book(tok, "2099-09-24T19:00", "t_3", 2)[1]["reference"]
+    H = lambda k: {"Idempotency-Key": k}  # noqa
+    s, js = call("POST", "/reservation-moves", {"moves": [{"reference": a, "table_ids": ["t_1", "t_2"], "party_size": 5}]}, tok, H("PM1"))
+    check("moves to pair", s == 201 and js["reservations"][0]["table_ids"] == ["t_1", "t_2"], (s, js))
+    expect("moves overlap pair", call("POST", "/reservation-moves", {"moves": [{"reference": b, "table_ids": ["t_2", "t_3"], "party_size": 5}]}, tok, H("PM2")), 409, "table_unavailable")
+    expect("moves both fields", call("POST", "/reservation-moves", {"moves": [{"reference": b, "table_id": "t_3", "table_ids": ["t_3"]}]}, tok, H("PM3")), 422, "validation_failed")
+    expect("moves bad pair", call("POST", "/reservation-moves", {"moves": [{"reference": b, "table_ids": ["t_1", "t_3"]}]}, tok, H("PM4")), 422, "combination_not_allowed")
+    s, js = call("POST", "/reservation-moves", {"moves": [{"reference": a, "table_ids": ["t_2", "t_3"], "party_size": 5}, {"reference": b, "table_id": "t_1", "party_size": 2}]}, tok, H("PM5"))
+    check("moves swap into pair", s == 201 and js["reservations"][1]["table_ids"] == ["t_1"], (s, js))
+    # fixtures
+    bad = comb_fixture()
+    bad["restaurants"][0]["combinable"] = [["t_1", "t_2"], ["t_2", "t_1"]]
+    expect("dup pair fixture", reset(bad), 422, "validation_failed")
+    bad["restaurants"][0]["combinable"] = [["t_1", "t_2", "t_3"]]
+    expect("triple pair fixture", reset(bad), 422, "validation_failed")
+    bad["restaurants"][0]["combinable"] = [["t_1", "zz"]]
+    expect("unknown pair fixture", reset(bad), 422, "validation_failed")
+    seed = comb_fixture()
+    seed["reservations"] = [
+        {"id": "s1", "reference": "SEEDAA", "user_id": "u_ada", "restaurant_id": "r_anker", "table_ids": ["t_1", "t_2"],
+         "starts_at_local": "2099-09-24T19:00", "party_size": 5},
+        {"id": "s2", "reference": "SEEDBB", "user_id": "u_ada", "restaurant_id": "r_anker", "table_id": "t_3",
+         "starts_at_local": "2099-09-24T19:00", "party_size": 2, "status": "cancelled"}]
+    expect("seed pairs", reset(seed), 204)
+    s, js = call("POST", "/auth/login", {"email": "ada@example.com", "password": "correct horse"})
+    s, r1 = call("GET", "/reservations/SEEDAA", token=js["token"])
+    check("seeded pair", s == 200 and r1["table_ids"] == ["t_1", "t_2"] and "table_id" not in r1, r1)
+    s, r2 = call("GET", "/reservations/SEEDBB", token=js["token"])
+    check("seeded cancelled single", r2["status"] == "cancelled" and r2["table_id"] == "t_3", r2)
+    s, a = call("GET", "/availability?restaurant_id=r_anker&date=2099-09-24&party_size=1")
+    check("seed occupies; cancelled doesn't", a["slots"][2]["available_table_ids"] == ["t_3"], a["slots"][2])
+    seed["reservations"][0]["table_id"] = "t_1"
+    expect("seed both fields", reset(seed), 422, "validation_failed")
+
+
+def t_combined_concurrency():
+    reset(comb_fixture())
+    toks = [signup("c%d@example.com" % i)[0] for i in range(10)]
+    ops = [(["t_1", "t_2"], 5), (["t_2", "t_3"], 5), (["t_1"], 2), (["t_2"], 3), (["t_3"], 3)]
+    starts = ["18:00", "18:30", "19:00", "19:30"]
+
+    def go(i):
+        ids, party = ops[i % 5]
+        return bk(toks[i % 10], ids, "2099-09-24T" + starts[i % 4], party)
+    outs = parallel(go, 50)
+    check("conc combos only 201/409", all(o[0] in (201, 409) for o in outs), [o[0] for o in outs])
+    wins = [o[1] for o in outs if o[0] == 201]
+    bad = []
+    for i, a in enumerate(wins):
+        for b in wins[i + 1:]:
+            if set(a["table_ids"]) & set(b["table_ids"]) and a["starts_at"] < b["ends_at"] and b["starts_at"] < a["ends_at"]:
+                bad.append((a["table_ids"], a["starts_at"], b["table_ids"], b["starts_at"]))
+    check("no shared table in overlapping bookings", not bad and len(wins) > 0, bad[:3])
+    # concurrent patches to the same pair
+    reset(comb_fixture())
+    toks = [signup("d%d@example.com" % i)[0] for i in range(2)]
+    r0 = book(toks[0], "2099-09-24T18:00", "t_1", 2)[1]["reference"]
+    r1 = book(toks[1], "2099-09-24T18:00", "t_3", 2)[1]["reference"]
+    outs = parallel(lambda i: call("PATCH", "/reservations/" + (r0 if i % 2 == 0 else r1),
+                                   {"table_ids": ["t_1", "t_2"] if i % 2 == 0 else ["t_2", "t_3"], "starts_at_local": "2099-09-24T20:00", "party_size": 5},
+                                   toks[i % 2]), 50)
+    check("patch race one side wins", len({i % 2 for i, o in enumerate(outs) if o[0] == 200}) == 1 and all(o[0] in (200, 409) for o in outs), [o[0] for o in outs])
+
+
+def t_e11():
+    reset()
+    tok, _ = signup()
+    huge = "9" * 5000
+    s, js = call("POST", "/reservations", raw='{"restaurant_id":"r_anker","table_id":"t_2","starts_at_local":"2099-09-24T19:00","party_size":%s}' % huge, token=tok, headers={"Idempotency-Key": "H1"})
+    check("huge party 422 (not 400)", s == 422 and js["error"]["code"] in ("validation_failed", "party_exceeds_capacity"), (s, js))
+    fx = fixture()
+    s, js = call("POST", "/_test/reset", raw=json.dumps(fx).replace('"slot_minutes": 30', '"slot_minutes": %s' % huge))
+    check("huge slot fixture handled", s in (204, 422), (s, js))
+    reset()
+    s, js = call("GET", "/availability?restaurant_id=r_anker&date=0100-01-04&party_size=1")
+    check("old year padded", s == 200 and all(x["starts_at"].startswith("0100-01-04T") for x in js["slots"]) and len(js["slots"]) > 0, (s, str(js)[:300]))
+    fx = fixture()
+    fx["restaurants"][2]["timezone"] = "Europe/Berlin"
+    fx["restaurants"][2]["opening_hours"] = [{"weekday": d, "opens": "10:00", "closes": "12:00"} for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")]
+    reset(fx)
+    s, js = call("GET", "/availability?restaurant_id=r_be&date=1850-01-01&party_size=1")
+    ok = s == 200 and len(js["slots"]) > 0 and all(len(x["starts_at"]) == 25 and x["starts_at"][-6] in "+-" and x["starts_at"][-3] == ":" for x in js["slots"])
+    check("LMT offset whole minutes", ok, (s, str(js)[:300]))
+    s, js = call("GET", "/availability?restaurant_id=r_be&date=1850-01-01&party_size=" + huge)
+    check("huge query party", s in (200, 422), s)
+
+
 def t_load():
     reset()
     outs = parallel(lambda i: call("POST", "/auth/signup", {"email": "l%d@x.io" % i, "password": "password1", "display_name": "L"}), 50)
