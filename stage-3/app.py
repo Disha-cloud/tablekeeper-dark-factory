@@ -161,8 +161,158 @@ def v_id(x):
     return x
 
 
+def parse_hours(hours, unique=False):
+    """-> (normalised list, by-weekday windows). Raises Invalid."""
+    if not isinstance(hours, list):
+        raise Invalid("opening_hours")
+    out = []
+    by = {}
+    for h in hours:
+        if not isinstance(h, dict):
+            raise Invalid("opening_hours entry")
+        wd, op, cl = h.get("weekday"), h.get("opens"), h.get("closes")
+        if wd not in WEEKDAYS:
+            raise Invalid("weekday")
+        mo = HHMM_RE.fullmatch(op) if isinstance(op, str) else None
+        mc = HHMM_RE.fullmatch(cl) if isinstance(cl, str) else None
+        if not mo or not mc:
+            raise Invalid("opens/closes")
+        o = int(mo.group(1)) * 60 + int(mo.group(2))
+        c = int(mc.group(1)) * 60 + int(mc.group(2))
+        if c <= o:
+            raise Invalid("closes before opens")
+        if unique and WEEKDAYS.index(wd) in by:
+            raise Invalid("duplicate weekday")
+        out.append({"weekday": wd, "opens": op, "closes": cl})
+        by.setdefault(WEEKDAYS.index(wd), []).append((o, c))
+    for v in by.values():
+        v.sort()
+    return out, by
+
+
+class Policy:
+    """Immutable booking rules. Policy 0 is the fixture; others are published."""
+
+    def __init__(self, version, eff, slot, dur, cutoff, hours, by_wd, caps):
+        self.version = version
+        self.eff = eff
+        self.slot = slot
+        self.dur = dur
+        self.cutoff = cutoff
+        self.hours = hours
+        self.by_wd = by_wd
+        self.caps = caps
+
+    def terms(self):
+        return {"policy_version": self.version, "slot_minutes": self.slot,
+                "reservation_duration_minutes": self.dur,
+                "cancellation_cutoff_minutes": self.cutoff,
+                "opening_hours": copy.deepcopy(self.hours),
+                "capacities": dict(self.caps)}
+
+    def to_json(self, rid):
+        out = {"restaurant_id": rid, "policy_version": self.version,
+               "effective_from": self.eff, "slot_minutes": self.slot,
+               "reservation_duration_minutes": self.dur,
+               "cancellation_cutoff_minutes": self.cutoff,
+               "opening_hours": copy.deepcopy(self.hours), "capacities": dict(self.caps)}
+        return out
+
+    def capacity(self, ids):
+        return sum(self.caps[t] for t in ids)
+
+    def check_slot(self, tz, parts):
+        """Rule chain D5 up to (not including) capacity. Returns start epoch."""
+        y, mo, d, h, mi = parts
+        try:
+            e = local_to_epoch(y, mo, d, h, mi, tz)
+        except Unrep:
+            raise err(422, "outside_opening_hours")
+        if e is None:
+            raise err(422, "invalid_local_time", "local time does not exist")
+        wd = dt.date(y, mo, d).weekday()
+        minute = h * 60 + mi
+        win = None
+        for o, c in self.by_wd.get(wd, ()):
+            if o <= minute:
+                win = (o, c)
+        if win is None:
+            raise err(422, "outside_opening_hours")
+        o, c = win
+        try:
+            ce = closes_epoch(y, mo, d, c // 60, c % 60, tz)
+        except Unrep:
+            raise err(422, "outside_opening_hours")
+        if e + self.dur * 60 > ce:
+            raise err(422, "outside_opening_hours")
+        if (minute - o) % self.slot:
+            raise err(422, "not_on_slot_grid")
+        return e
+
+    def slots(self, tz, y, mo, d):
+        out = []
+        seen = set()
+        wd = dt.date(y, mo, d).weekday()
+        for o, c in self.by_wd.get(wd, ()):
+            try:
+                ce = closes_epoch(y, mo, d, c // 60, c % 60, tz)
+            except Unrep:
+                continue
+            m = o
+            while m < c:
+                try:
+                    e = local_to_epoch(y, mo, d, m // 60, m % 60, tz)
+                except Unrep:
+                    e = None
+                if e is not None and e + self.dur * 60 <= ce and m not in seen:
+                    seen.add(m)
+                    out.append((m, e))
+                m += self.slot
+        out.sort()
+        return out
+
+
+def parse_policy(body, rest):
+    """Validate a complete published policy (422 on any problem)."""
+    def bad(msg):
+        return err(422, "validation_failed", msg)
+    for k in ("effective_from", "slot_minutes", "reservation_duration_minutes",
+              "cancellation_cutoff_minutes", "opening_hours", "capacities"):
+        if k not in body:
+            raise bad("%s is required" % k)
+    eff = body["effective_from"]
+    m = DATE_RE.fullmatch(eff) if isinstance(eff, str) else None
+    if not m:
+        raise bad("effective_from must be YYYY-MM-DD")
+    try:
+        dt.date(*(int(x) for x in m.groups()))
+    except ValueError:
+        raise bad("effective_from is not a real date")
+    slot = body["slot_minutes"]
+    dur = body["reservation_duration_minutes"]
+    cutoff = body["cancellation_cutoff_minutes"]
+    if not (is_int(slot) and 1 <= slot <= 1440):
+        raise bad("slot_minutes must be an integer 1..1440")
+    if not (is_int(dur) and 1 <= dur <= 1440):
+        raise bad("reservation_duration_minutes must be an integer 1..1440")
+    if not (is_int(cutoff) and 0 <= cutoff <= 10080):
+        raise bad("cancellation_cutoff_minutes must be an integer 0..10080")
+    try:
+        hours, by = parse_hours(body["opening_hours"], unique=True)
+    except Invalid:
+        raise bad("invalid opening_hours")
+    caps = body["capacities"]
+    if not isinstance(caps, dict) or set(caps) != set(rest.table_by_id):
+        raise bad("capacities must name exactly the restaurant's tables")
+    for v in caps.values():
+        if not (is_int(v) and 1 <= v <= 100):
+            raise bad("capacities must be integers 1..100")
+    ordered = {t["id"]: caps[t["id"]] for t in rest.tables}
+    return Policy(0, eff, slot, dur, cutoff, hours, by, ordered)
+
+
 class Rest:
-    def __init__(self, d):
+    def __init__(self, d, importing=False):
         if not isinstance(d, dict):
             raise Invalid("restaurant")
         self.id = v_id(d.get("id"))
@@ -177,38 +327,16 @@ class Rest:
         except Exception:
             raise Invalid("timezone")
         self.timezone = tzname
-        self.slot = d.get("slot_minutes")
-        self.dur = d.get("reservation_duration_minutes")
-        self.cutoff = d.get("cancellation_cutoff_minutes", 0)
-        if not (is_int(self.slot) and self.slot >= 1):
+        slot = d.get("slot_minutes")
+        dur = d.get("reservation_duration_minutes")
+        cutoff = d.get("cancellation_cutoff_minutes", 0)
+        if not (is_int(slot) and slot >= 1):
             raise Invalid("slot_minutes")
-        if not (is_int(self.dur) and self.dur >= 1):
+        if not (is_int(dur) and dur >= 1):
             raise Invalid("reservation_duration_minutes")
-        if not (is_int(self.cutoff) and self.cutoff >= 0):
+        if not (is_int(cutoff) and cutoff >= 0):
             raise Invalid("cancellation_cutoff_minutes")
-        hours = d.get("opening_hours", [])
-        if not isinstance(hours, list):
-            raise Invalid("opening_hours")
-        self.hours = []
-        self.by_wd = {}
-        for h in hours:
-            if not isinstance(h, dict):
-                raise Invalid("opening_hours entry")
-            wd, op, cl = h.get("weekday"), h.get("opens"), h.get("closes")
-            if wd not in WEEKDAYS:
-                raise Invalid("weekday")
-            mo = HHMM_RE.fullmatch(op) if isinstance(op, str) else None
-            mc = HHMM_RE.fullmatch(cl) if isinstance(cl, str) else None
-            if not mo or not mc:
-                raise Invalid("opens/closes")
-            o = int(mo.group(1)) * 60 + int(mo.group(2))
-            c = int(mc.group(1)) * 60 + int(mc.group(2))
-            if c <= o:
-                raise Invalid("closes before opens")
-            self.hours.append({"weekday": wd, "opens": op, "closes": cl})
-            self.by_wd.setdefault(WEEKDAYS.index(wd), []).append((o, c))
-        for v in self.by_wd.values():
-            v.sort()
+        hours, by_wd = parse_hours(d.get("opening_hours", []))
         tables = d.get("tables", [])
         if not isinstance(tables, list):
             raise Invalid("tables")
@@ -242,17 +370,56 @@ class Rest:
                 raise Invalid("duplicate pair")
             self.pairs[key] = [p[0], p[1]]
             self.combinable.append([p[0], p[1]])
+        mgr = d.get("manager_user_ids", [])
+        if not isinstance(mgr, list):
+            raise Invalid("manager_user_ids")
+        self.managers = [v_id(x) for x in mgr]
+        self.p0 = Policy(0, None, slot, dur, cutoff, hours, by_wd,
+                         {t["id"]: t["capacity"] for t in self.tables})
+        self.policies = []
+        self.revision = 0
+        if importing:
+            rev = d.get("revision", 0)
+            if not (is_int(rev) and rev >= 0):
+                raise Invalid("revision")
+            self.revision = rev
+            pols = d.get("policies", [])
+            if not isinstance(pols, list):
+                raise Invalid("policies")
+            for i, pd in enumerate(pols):
+                if not isinstance(pd, dict) or pd.get("policy_version") != i + 1 \
+                        or not is_int(pd.get("policy_version")):
+                    raise Invalid("policy_version")
+                try:
+                    p = parse_policy(pd, self)
+                except ApiError:
+                    raise Invalid("policy")
+                p.version = i + 1
+                self.policies.append(p)
 
-    def to_json(self):
-        return {
+    def to_json(self, export=False):
+        p0 = self.p0
+        out = {
             "id": self.id, "name": self.name, "timezone": self.timezone,
-            "slot_minutes": self.slot,
-            "reservation_duration_minutes": self.dur,
-            "cancellation_cutoff_minutes": self.cutoff,
-            "opening_hours": copy.deepcopy(self.hours),
+            "slot_minutes": p0.slot,
+            "reservation_duration_minutes": p0.dur,
+            "cancellation_cutoff_minutes": p0.cutoff,
+            "opening_hours": copy.deepcopy(p0.hours),
             "tables": copy.deepcopy(self.tables),
             "combinable": copy.deepcopy(self.combinable),
+            "manager_user_ids": list(self.managers),
+            "revision": self.revision,
         }
+        if export:
+            out["policies"] = [p.to_json(self.id) for p in self.policies]
+        return out
+
+    def policy_for(self, datestr):
+        best = None
+        for p in self.policies:
+            if p.eff <= datestr and (best is None or (p.eff, p.version) > (best.eff, best.version)):
+                best = p
+        return best or self.p0
 
     def resolve(self, ids):
         """Table-selection steps 4-5: unknown ids -> 404, undeclared pair -> 422.
@@ -267,58 +434,9 @@ class Rest:
             return list(pair)
         return list(ids)
 
-    def capacity(self, ids):
-        return sum(self.table_by_id[t]["capacity"] for t in ids)
 
-    def check_slot(self, parts):
-        """Rule chain D5 up to (not including) capacity. Returns start epoch."""
-        y, mo, d, h, mi = parts
-        try:
-            e = local_to_epoch(y, mo, d, h, mi, self.tz)
-        except Unrep:
-            raise err(422, "outside_opening_hours")
-        if e is None:
-            raise err(422, "invalid_local_time", "local time does not exist")
-        wd = dt.date(y, mo, d).weekday()
-        minute = h * 60 + mi
-        win = None
-        for o, c in self.by_wd.get(wd, ()):
-            if o <= minute:
-                win = (o, c)
-        if win is None:
-            raise err(422, "outside_opening_hours")
-        o, c = win
-        try:
-            ce = closes_epoch(y, mo, d, c // 60, c % 60, self.tz)
-        except Unrep:
-            raise err(422, "outside_opening_hours")
-        if e + self.dur * 60 > ce:
-            raise err(422, "outside_opening_hours")
-        if (minute - o) % self.slot:
-            raise err(422, "not_on_slot_grid")
-        return e
-
-    def slots(self, y, mo, d):
-        out = []
-        seen = set()
-        wd = dt.date(y, mo, d).weekday()
-        for o, c in self.by_wd.get(wd, ()):
-            try:
-                ce = closes_epoch(y, mo, d, c // 60, c % 60, self.tz)
-            except Unrep:
-                continue
-            m = o
-            while m < c:
-                try:
-                    e = local_to_epoch(y, mo, d, m // 60, m % 60, self.tz)
-                except Unrep:
-                    e = None
-                if e is not None and e + self.dur * 60 <= ce and m not in seen:
-                    seen.add(m)
-                    out.append((m, e))
-                m += self.slot
-        out.sort()
-        return out
+def date_of(parts):
+    return "%04d-%02d-%02d" % parts[:3]
 
 
 # ------------------------------------------------------------------ state --
@@ -333,8 +451,10 @@ class State:
         self.res_ids = set()
         self.by_table = {}
         self.idem = {}
+        self.series = {}
         self.n_res = 0
         self.n_user = 0
+        self.n_series = 0
 
     def index_add(self, r):
         for t in r["tids"]:
@@ -465,7 +585,55 @@ def sel_ids(body):
     return None
 
 
-def build_res(d, rests):
+def created_changes(tids, local, party):
+    first = {"field": "table_id", "from": None, "to": tids[0]} if len(tids) == 1 \
+        else {"field": "table_ids", "from": None, "to": list(tids)}
+    return [first, {"field": "starts_at_local", "from": None, "to": local},
+            {"field": "party_size", "from": None, "to": party}]
+
+
+def diff_changes(old, new):
+    ch = []
+    if old["tids"] != new["tids"]:
+        if len(old["tids"]) == 1 and len(new["tids"]) == 1:
+            ch.append({"field": "table_id", "from": old["tids"][0], "to": new["tids"][0]})
+        else:
+            ch.append({"field": "table_ids", "from": list(old["tids"]), "to": list(new["tids"])})
+    if old["local"] != new["local"]:
+        ch.append({"field": "starts_at_local", "from": old["local"], "to": new["local"]})
+    if old["party"] != new["party"]:
+        ch.append({"field": "party_size", "from": old["party"], "to": new["party"]})
+    return ch
+
+
+def valid_terms(t):
+    if not isinstance(t, dict):
+        raise Invalid("terms")
+    if not (is_int(t.get("policy_version")) and t["policy_version"] >= 0
+            and is_int(t.get("slot_minutes")) and t["slot_minutes"] >= 1
+            and is_int(t.get("reservation_duration_minutes")) and t["reservation_duration_minutes"] >= 1
+            and is_int(t.get("cancellation_cutoff_minutes")) and t["cancellation_cutoff_minutes"] >= 0
+            and isinstance(t.get("opening_hours"), list) and isinstance(t.get("capacities"), dict)):
+        raise Invalid("terms")
+    return copy.deepcopy(t)
+
+
+def valid_hist(h):
+    if not isinstance(h, list) or not h:
+        raise Invalid("history")
+    out = []
+    for i, e in enumerate(h):
+        if not (isinstance(e, dict) and e.get("seq") == i + 1 and is_int(e.get("seq"))
+                and isinstance(e.get("at"), str) and e.get("event") in ("created", "changed", "cancelled")
+                and isinstance(e.get("changes"), list) and is_int(e.get("revision"))):
+            raise Invalid("history entry")
+        out.append({"seq": e["seq"], "at": e["at"], "event": e["event"],
+                    "changes": copy.deepcopy(e["changes"]), "revision": e["revision"],
+                    "accepted_terms": valid_terms(e.get("accepted_terms"))})
+    return out
+
+
+def build_res(d, rests, importing=False):
     if not isinstance(d, dict):
         raise Invalid("reservation")
     rid_ = v_id(d.get("id"))
@@ -503,20 +671,43 @@ def build_res(d, rests):
         raise Invalid("starts_at_local")
     if e is None:
         raise Invalid("starts_at_local")
-    end = e + rest.dur * 60
+    cts = parse_created(d.get("created_at"))
+    series_id = series_idx = None
+    if importing and "accepted_terms" in d:
+        terms = valid_terms(d["accepted_terms"])
+        rev = d.get("revision")
+        if not (is_int(rev) and rev >= 1):
+            raise Invalid("revision")
+        hist = valid_hist(d.get("history"))
+        series_id = d.get("series_id")
+        series_idx = d.get("series_index")
+        if series_id is not None and not (isinstance(series_id, str) and is_int(series_idx) and series_idx >= 0):
+            raise Invalid("series link")
+    else:
+        terms = rest.p0.terms()
+        rev = 1
+        at = fmt_epoch(cts, rest.tz)
+        hist = [{"seq": 1, "at": at, "event": "created", "changes": created_changes(tids, local, party),
+                 "revision": 1, "accepted_terms": copy.deepcopy(terms)}]
+        if status == "cancelled":
+            hist.append({"seq": 2, "at": at, "event": "cancelled", "changes": [], "revision": 1,
+                         "accepted_terms": copy.deepcopy(terms)})
+    end = e + terms["reservation_duration_minutes"] * 60
     if end > MAX_E:
         raise Invalid("end not representable")
-    cts = parse_created(d.get("created_at"))
     return {"id": rid_, "ref": ref, "user": user, "rid": rid, "tids": tids,
             "party": party, "status": status, "local": local, "start": e,
-            "end": end, "cts": cts}
+            "end": end, "cts": cts, "rev": rev, "terms": terms, "hist": hist,
+            "series": series_id, "idx": series_idx}
 
 
 def res_export(r):
     return {"id": r["id"], "reference": r["ref"], "user_id": r["user"],
             "restaurant_id": r["rid"], "table_ids": list(r["tids"]), "party_size": r["party"],
             "status": r["status"], "starts_at_local": r["local"],
-            "created_at": fmt_utc(r["cts"])}
+            "created_at": fmt_utc(r["cts"]), "revision": r["rev"],
+            "accepted_terms": copy.deepcopy(r["terms"]), "history": copy.deepcopy(r["hist"]),
+            "series_id": r["series"], "series_index": r["idx"]}
 
 
 def res_json(r):
@@ -526,16 +717,17 @@ def res_json(r):
         "table_ids": list(r["tids"]), "party_size": r["party"], "status": r["status"],
         "starts_at_local": r["local"], "starts_at": fmt_epoch(r["start"], tz),
         "ends_at": fmt_epoch(r["end"], tz), "created_at": fmt_utc(r["cts"]),
+        "revision": r["rev"], "accepted_terms": copy.deepcopy(r["terms"]),
     }
     if len(r["tids"]) == 1:
         out["table_id"] = r["tids"][0]
     return out
 
 
-def build_rests_and_res(rest_list, res_list):
+def build_rests_and_res(rest_list, res_list, importing=False):
     rests = {}
     for x in rest_list:
-        r = Rest(x)
+        r = Rest(x, importing)
         if r.id in rests:
             raise Invalid("duplicate restaurant")
         rests[r.id] = r
@@ -543,7 +735,7 @@ def build_rests_and_res(rest_list, res_list):
     refs = set()
     ids = set()
     for x in res_list:
-        r = build_res(x, rests)
+        r = build_res(x, rests, importing)
         if r["ref"] in refs or r["id"] in ids:
             raise Invalid("duplicate reservation")
         refs.add(r["ref"])
@@ -705,15 +897,20 @@ async def h_export(req):
     st = {
         "users": [dict(u) for u in S.users.values()],
         "tokens": dict(S.tokens),
-        "restaurants": [r.to_json() for r in S.rests.values()],
+        "restaurants": [r.to_json(export=True) for r in S.rests.values()],
         "reservations": [res_export(r) for r in S.res.values()],
         "idempotency": [
             {"user": k[0], "route": k[1], "key": k[2], "body": v["body"],
              "status": v["status"], "response": copy.deepcopy(v["response"])}
             for k, v in S.idem.items()],
-        "counters": {"reservation": S.n_res, "user": S.n_user},
+        "series": [{"id": x["id"], "user_id": x["user"], "restaurant_id": x["rid"],
+                    "anchor_reference": x["anchor"], "count": x["count"],
+                    "interval_weeks": x["interval"], "revision": x["rev"],
+                    "references": list(x["refs"]), "exceptions": list(x["exc"])}
+                   for x in S.series.values()],
+        "counters": {"reservation": S.n_res, "user": S.n_user, "series": S.n_series},
         "references": sorted(S.res.keys()),
-        "schema": 2,
+        "schema": 3,
     }
     return 200, {"track": "tablekeeper", "format_version": 1, "state": st}
 
@@ -729,7 +926,8 @@ def build_import(body):
         raise Invalid("state")
     if has_surrogate(st):
         raise Invalid("surrogate")
-    if "schema" in st and not (is_int(st["schema"]) and st["schema"] == 2):
+    schema = st.get("schema")
+    if "schema" in st and not (is_int(schema) and schema in (2, 3)):
         raise Invalid("schema")
     for k in ("users", "restaurants", "reservations", "idempotency"):
         if not isinstance(st.get(k), list):
@@ -740,6 +938,9 @@ def build_import(body):
     if not isinstance(counters, dict) or not is_int(counters.get("reservation")) \
             or not is_int(counters.get("user")) or counters["reservation"] < 0 \
             or counters["user"] < 0:
+        raise Invalid("counters")
+    n_series = counters.get("series", 0)
+    if not (is_int(n_series) and n_series >= 0):
         raise Invalid("counters")
     new = State()
     for _, _, _, u in build_users_meta(st["users"]):
@@ -753,7 +954,7 @@ def build_import(body):
         if not isinstance(uid, str) or uid not in new.users or not tok:
             raise Invalid("token")
         new.tokens[tok] = uid
-    new.rests, reslist = build_rests_and_res(st["restaurants"], st["reservations"])
+    new.rests, reslist = build_rests_and_res(st["restaurants"], st["reservations"], importing=True)
     for r in reslist:
         new.add_res(r)
     for rec in st["idempotency"]:
@@ -767,8 +968,33 @@ def build_import(body):
             raise Invalid("idempotency")
         new.idem[(u, route, key)] = {"body": b, "status": status,
                                      "response": rec["response"]}
+    for x in st.get("series", []) if isinstance(st.get("series", []), list) else None:
+        if not isinstance(x, dict):
+            raise Invalid("series")
+        sid = x.get("id")
+        refs = x.get("references")
+        exc = x.get("exceptions")
+        if not (isinstance(sid, str) and isinstance(refs, list) and isinstance(exc, list)
+                and len(refs) == len(exc) and all(isinstance(b, bool) for b in exc)
+                and is_int(x.get("count")) and x["count"] == len(refs)
+                and is_int(x.get("interval_weeks")) and is_int(x.get("revision"))
+                and isinstance(x.get("user_id"), str) and isinstance(x.get("restaurant_id"), str)
+                and isinstance(x.get("anchor_reference"), str) and sid not in new.series):
+            raise Invalid("series")
+        for i, ref in enumerate(refs):
+            rr = new.res.get(ref) if isinstance(ref, str) else None
+            if rr is None or rr["series"] != sid or rr["idx"] != i:
+                raise Invalid("series link")
+        new.series[sid] = {"id": sid, "user": x["user_id"], "rid": x["restaurant_id"],
+                           "anchor": x["anchor_reference"], "count": x["count"],
+                           "interval": x["interval_weeks"], "rev": x["revision"],
+                           "refs": list(refs), "exc": list(exc)}
+    for rr in new.res.values():
+        if rr["series"] is not None and rr["series"] not in new.series:
+            raise Invalid("series link")
     new.n_res = max(new.n_res, counters["reservation"])
     new.n_user = counters["user"]
+    new.n_series = n_series
     return new
 
 
@@ -872,26 +1098,43 @@ async def h_availability(req):
         dt.date(y, mo, d)
     except ValueError:
         raise err(422, "validation_failed", "invalid date")
+    explain = None
+    if "explain" in q:
+        if q["explain"] != "true":
+            raise err(422, "validation_failed", "explain must be true")
+        explain = True
     rest = S.rests.get(q["restaurant_id"])
     if rest is None:
         raise err(404, "not_found", "no such restaurant")
     party = int(ps)
+    pol = rest.policy_for(q["date"])
     slots = []
-    for m_, e in rest.slots(y, mo, d):
-        end = e + rest.dur * 60
+    for m_, e in pol.slots(rest.tz, y, mo, d):
+        end = e + pol.dur * 60
         free = {t["id"] for t in rest.tables
                 if not S.conflict(rest.id, (t["id"],), e, end, ())}
         avail = [t["id"] for t in rest.tables
-                 if t["capacity"] >= party and t["id"] in free]
-        options = [{"table_ids": [t["id"]], "capacity": t["capacity"]} for t in rest.tables
-                   if t["capacity"] >= party and t["id"] in free]
+                 if pol.caps[t["id"]] >= party and t["id"] in free]
+        options = [{"table_ids": [t["id"]], "capacity": pol.caps[t["id"]]} for t in rest.tables
+                   if pol.caps[t["id"]] >= party and t["id"] in free]
         for pair in rest.combinable:
-            cap = rest.capacity(pair)
+            cap = pol.capacity(pair)
             if cap >= party and pair[0] in free and pair[1] in free:
                 options.append({"table_ids": list(pair), "capacity": cap})
-        slots.append({"starts_at_local": "%04d-%02d-%02dT%02d:%02d" % (y, mo, d, m_ // 60, m_ % 60),
-                      "starts_at": fmt_epoch(e, rest.tz), "available_table_ids": avail,
-                      "available_options": options})
+        slot = {"starts_at_local": "%04d-%02d-%02dT%02d:%02d" % (y, mo, d, m_ // 60, m_ % 60),
+                "starts_at": fmt_epoch(e, rest.tz), "available_table_ids": avail,
+                "available_options": options}
+        if explain:
+            ex = []
+            for t in rest.tables:
+                cap_ok = party <= pol.caps[t["id"]]
+                free_ok = t["id"] in free
+                ex.append({"table_id": t["id"], "policy_version": pol.version,
+                           "available": cap_ok and free_ok,
+                           "rules": [{"rule": "capacity", "holds": cap_ok},
+                                     {"rule": "no_overlap", "holds": free_ok}]})
+            slot["explain"] = ex
+        slots.append(slot)
     return 200, {"restaurant_id": rest.id, "date": q["date"], "timezone": rest.timezone,
                  "slots": slots}
 
@@ -900,6 +1143,44 @@ def type_check_strings(body, names):
     for k in names:
         if k in body and not isinstance(body[k], str):
             raise err(400, "malformed_request", "%s must be a string" % k)
+
+
+def hist_add(r, event, changes, at=None):
+    tz = S.rests[r["rid"]].tz
+    r["hist"].append({"seq": len(r["hist"]) + 1,
+                      "at": fmt_epoch(int(time.time()) if at is None else at, tz),
+                      "event": event, "changes": changes, "revision": r["rev"],
+                      "accepted_terms": copy.deepcopy(r["terms"])})
+
+
+def make_res(user, rest, tids, party, local, start, pol):
+    now = int(time.time())
+    r = {"id": new_res_id(), "ref": new_ref(), "user": user["id"], "rid": rest.id,
+         "tids": list(tids), "party": party, "status": "confirmed",
+         "local": local, "start": start, "end": start + pol.dur * 60,
+         "cts": now, "rev": 1, "terms": pol.terms(), "hist": [], "series": None, "idx": None}
+    hist_add(r, "created", created_changes(r["tids"], local, party), at=now)
+    S.add_res(r)
+    return r
+
+
+def hist_add(r, event, changes, at=None):
+    tz = S.rests[r["rid"]].tz
+    r["hist"].append({"seq": len(r["hist"]) + 1,
+                      "at": fmt_epoch(int(time.time()) if at is None else at, tz),
+                      "event": event, "changes": changes, "revision": r["rev"],
+                      "accepted_terms": copy.deepcopy(r["terms"])})
+
+
+def make_res(user, rest, tids, party, local, start, pol):
+    now = int(time.time())
+    r = {"id": new_res_id(), "ref": new_ref(), "user": user["id"], "rid": rest.id,
+         "tids": list(tids), "party": party, "status": "confirmed",
+         "local": local, "start": start, "end": start + pol.dur * 60,
+         "cts": now, "rev": 1, "terms": pol.terms(), "hist": [], "series": None, "idx": None}
+    hist_add(r, "created", created_changes(r["tids"], local, party), at=now)
+    S.add_res(r)
+    return r
 
 
 async def h_create(req):
@@ -925,18 +1206,15 @@ async def h_create(req):
     if rest is None:
         raise err(404, "not_found", "no such restaurant")
     tids = rest.resolve(ids)
-    start = rest.check_slot(parts)
+    pol = rest.policy_for(date_of(parts))
+    start = pol.check_slot(rest.tz, parts)
     party = body["party_size"]
-    if party > rest.capacity(tids):
+    if party > pol.capacity(tids):
         raise err(422, "party_exceeds_capacity")
-    end = start + rest.dur * 60
-    if S.conflict(rest.id, tids, start, end, ()):
+    if S.conflict(rest.id, tids, start, start + pol.dur * 60, ()):
         raise err(409, "table_unavailable")
-    r = {"id": new_res_id(), "ref": new_ref(), "user": user["id"], "rid": rest.id,
-         "tids": tids, "party": party, "status": "confirmed",
-         "local": body["starts_at_local"], "start": start, "end": end,
-         "cts": int(time.time())}
-    S.add_res(r)
+    r = make_res(user, rest, tids, party, body["starts_at_local"], start, pol)
+    rest.revision += 1
     resp = res_json(r)
     S.idem[ik] = {"body": canon, "status": 201, "response": resp}
     return 201, copy.deepcopy(resp)
@@ -958,9 +1236,38 @@ async def h_get(req):
     return 200, res_json(own_res(user, req.params[0]))
 
 
-def cutoff_check(r, rest):
-    if time.time() >= r["start"] - rest.cutoff * 60:
+def opt_own(req):
+    """History/decision: any auth failure or foreign reservation is a plain 404."""
+    try:
+        user = auth(req)
+    except ApiError:
+        raise err(404, "not_found", "no such reservation")
+    return own_res(user, req.params[0])
+
+
+async def h_history(req):
+    r = opt_own(req)
+    return 200, {"reference": r["ref"], "entries": copy.deepcopy(r["hist"])}
+
+
+async def h_decision(req):
+    r = opt_own(req)
+    return 200, {"reference": r["ref"], "revision": r["rev"],
+                 "accepted_terms": copy.deepcopy(r["terms"])}
+
+
+def cutoff_check(r):
+    if time.time() >= r["start"] - r["terms"]["cancellation_cutoff_minutes"] * 60:
         raise err(409, "cutoff_passed")
+
+
+def series_touch(r, exception):
+    sid = r["series"]
+    if sid is not None and sid in S.series:
+        s_ = S.series[sid]
+        s_["rev"] += 1
+        if exception:
+            s_["exc"][r["idx"]] = True
 
 
 async def h_cancel(req):
@@ -968,9 +1275,22 @@ async def h_cancel(req):
     r = own_res(user, req.params[0])
     if r["status"] == "cancelled":
         return 200, res_json(r)
-    cutoff_check(r, S.rests[r["rid"]])
+    cutoff_check(r)
     r["status"] = "cancelled"
+    r["rev"] += 1
+    hist_add(r, "cancelled", [])
+    S.rests[r["rid"]].revision += 1
+    series_touch(r, False)
     return 200, res_json(r)
+
+
+def check_expected_revision(r, body):
+    if "expected_revision" in body:
+        v = body["expected_revision"]
+        if not (is_int(v) and v >= 1):
+            raise err(422, "validation_failed", "expected_revision must be a positive integer")
+        if v != r["rev"]:
+            raise err(409, "stale_revision", "the reservation has changed")
 
 
 def plan_amend(r, body, types_first):
@@ -981,9 +1301,10 @@ def plan_amend(r, body, types_first):
         type_check_strings(body, ("starts_at_local",))
     if types_first:
         types()
+    check_expected_revision(r, body)
     if r["status"] != "confirmed":
         raise err(409, "reservation_cancelled")
-    cutoff_check(r, rest)
+    cutoff_check(r)
     if not types_first:
         types()
     party = r["party"]
@@ -998,14 +1319,20 @@ def plan_amend(r, body, types_first):
     else:
         shape_ids(ids)
     tids = rest.resolve(ids)
-    start = rest.check_slot(parts)
-    if party > rest.capacity(tids):
+    if tids == r["tids"] and local == r["local"] and party == r["party"]:
+        return {"noop": True, "tids": list(r["tids"]), "local": local, "party": party,
+                "start": r["start"], "end": r["end"], "terms": r["terms"]}
+    pol = rest.policy_for(date_of(parts))
+    start = pol.check_slot(rest.tz, parts)
+    if party > pol.capacity(tids):
         raise err(422, "party_exceeds_capacity")
-    return {"tids": tids, "local": local, "party": party, "start": start,
-            "end": start + rest.dur * 60}
+    return {"noop": False, "tids": tids, "local": local, "party": party, "start": start,
+            "end": start + pol.dur * 60, "terms": pol.terms()}
 
 
 def apply_plan(r, p):
+    """Commit a real amendment; returns nothing. Caller handles restaurant/series counters."""
+    old = {"tids": r["tids"], "local": r["local"], "party": r["party"]}
     if p["tids"] != r["tids"]:
         S.index_remove(r)
         r["tids"] = p["tids"]
@@ -1014,6 +1341,9 @@ def apply_plan(r, p):
     r["party"] = p["party"]
     r["start"] = p["start"]
     r["end"] = p["end"]
+    r["terms"] = p["terms"]
+    r["rev"] += 1
+    hist_add(r, "changed", diff_changes(old, {"tids": r["tids"], "local": r["local"], "party": r["party"]}))
 
 
 async def h_patch(req):
@@ -1021,9 +1351,13 @@ async def h_patch(req):
     r = own_res(user, req.params[0])
     body, _ = parse_obj(req)
     p = plan_amend(r, body, True)
+    if p["noop"]:
+        return 200, res_json(r)
     if S.conflict(r["rid"], p["tids"], p["start"], p["end"], (r["ref"],)):
         raise err(409, "table_unavailable")
     apply_plan(r, p)
+    S.rests[r["rid"]].revision += 1
+    series_touch(r, True)
     return 200, res_json(r)
 
 
@@ -1054,13 +1388,143 @@ async def h_moves(req):
             b = plans[j]
             if set(a["tids"]) & set(b["tids"]) and a["start"] < b["end"] and b["start"] < a["end"]:
                 raise err(409, "table_unavailable")
-        if S.conflict(ra["rid"], a["tids"], a["start"], a["end"], listed):
+        if not a["noop"] and S.conflict(ra["rid"], a["tids"], a["start"], a["end"], listed):
             raise err(409, "table_unavailable")
-    for r, p in zip(rs, plans):
+    changed = [(r, p) for r, p in zip(rs, plans) if not p["noop"]]
+    for r, p in changed:
         apply_plan(r, p)
+    if changed:
+        S.rests[rs[0]["rid"]].revision += 1
+        touched = {}
+        for r, _ in changed:
+            if r["series"] is not None and r["series"] in S.series:
+                touched.setdefault(r["series"], []).append(r["idx"])
+        for sid, idxs in touched.items():
+            S.series[sid]["rev"] += 1
+            for i in idxs:
+                S.series[sid]["exc"][i] = True
     resp = {"reservations": [res_json(r) for r in rs]}
     S.idem[ik] = {"body": canon, "status": 201, "response": resp}
     return 201, copy.deepcopy(resp)
+
+
+# ------------------------------------------------------------- policies ---
+
+async def h_policy_post(req):
+    user = auth(req)
+    body, canon = parse_obj(req)
+    ik, rec = idem_pre(req, user, canon)
+    if rec is not None:
+        return 200, rec["response"]
+    rest = S.rests.get(req.params[0])
+    if rest is None:
+        raise err(404, "not_found", "no such restaurant")
+    if user["id"] not in rest.managers:
+        raise err(403, "forbidden", "only managers may publish policies")
+    pol = parse_policy(body, rest)
+    pol.version = len(rest.policies) + 1
+    rest.policies.append(pol)
+    rest.revision += 1
+    resp = pol.to_json(rest.id)
+    S.idem[ik] = {"body": canon, "status": 201, "response": resp}
+    return 201, copy.deepcopy(resp)
+
+
+async def h_policy_list(req):
+    rest = S.rests.get(req.params[0])
+    if rest is None:
+        raise err(404, "not_found", "no such restaurant")
+    return 200, {"policies": [p.to_json(rest.id) for p in rest.policies]}
+
+
+# --------------------------------------------------------------- series ---
+
+def series_json(sr):
+    occ = []
+    for i, ref in enumerate(sr["refs"]):
+        occ.append({"index": i, "reference": ref, "exception": sr["exc"][i],
+                    "reservation": res_json(S.res[ref])})
+    return {"series_id": sr["id"], "revision": sr["rev"], "interval_weeks": sr["interval"],
+            "count": sr["count"], "anchor_reference": sr["anchor"], "occurrences": occ}
+
+
+async def h_series_create(req):
+    user = auth(req)
+    body, canon = parse_obj(req)
+    ik, rec = idem_pre(req, user, canon)
+    if rec is not None:
+        return 200, rec["response"]
+    ref = body.get("anchor_reference")
+    count = body.get("count")
+    iv = body.get("interval_weeks")
+    if not isinstance(ref, str):
+        raise err(422, "validation_failed", "anchor_reference is required")
+    if not (is_int(count) and 2 <= count <= 12):
+        raise err(422, "validation_failed", "count must be an integer 2..12")
+    if not (is_int(iv) and 1 <= iv <= 4):
+        raise err(422, "validation_failed", "interval_weeks must be an integer 1..4")
+    anchor = S.res.get(ref)
+    if anchor is None or anchor["user"] != user["id"]:
+        raise err(404, "not_found", "no such reservation")
+    if anchor["status"] != "confirmed":
+        raise err(409, "reservation_cancelled")
+    if anchor["series"] is not None:
+        raise err(409, "already_in_series")
+    cutoff_check(anchor)
+    rest = S.rests[anchor["rid"]]
+    y, mo, d, h, mi = parse_local(anchor["local"])
+    base = dt.date(y, mo, d)
+    pending = []
+    for i in range(1, count):
+        try:
+            nd = base + dt.timedelta(days=i * iv * 7)
+        except OverflowError:
+            raise err(422, "outside_opening_hours")
+        parts = (nd.year, nd.month, nd.day, h, mi)
+        pol = rest.policy_for(date_of(parts))
+        start = pol.check_slot(rest.tz, parts)
+        if anchor["party"] > pol.capacity(anchor["tids"]):
+            raise err(422, "party_exceeds_capacity")
+        end = start + pol.dur * 60
+        if S.conflict(rest.id, anchor["tids"], start, end, ()):
+            raise err(409, "table_unavailable")
+        for (_, s2, e2, _) in pending:
+            if s2 < end and start < e2:
+                raise err(409, "table_unavailable")
+        pending.append((parts, start, end, pol))
+    # commit
+    while True:
+        S.n_series += 1
+        sid = "ser_%d" % S.n_series
+        if sid not in S.series:
+            break
+    refs = [anchor["ref"]]
+    for parts, start, end, pol in pending:
+        local = "%04d-%02d-%02dT%02d:%02d" % parts
+        r = make_res(user, rest, anchor["tids"], anchor["party"], local, start, pol)
+        r["series"] = sid
+        r["idx"] = len(refs)
+        refs.append(r["ref"])
+    anchor["series"] = sid
+    anchor["idx"] = 0
+    S.series[sid] = {"id": sid, "user": user["id"], "rid": rest.id, "anchor": anchor["ref"],
+                     "count": count, "interval": iv, "rev": 1, "refs": refs,
+                     "exc": [False] * count}
+    rest.revision += 1
+    resp = series_json(S.series[sid])
+    S.idem[ik] = {"body": canon, "status": 201, "response": resp}
+    return 201, copy.deepcopy(resp)
+
+
+async def h_series_get(req):
+    try:
+        user = auth(req)
+    except ApiError:
+        raise err(404, "not_found", "no such series")
+    sr = S.series.get(req.params[0])
+    if sr is None or sr["user"] != user["id"]:
+        raise err(404, "not_found", "no such series")
+    return 200, series_json(sr)
 
 
 class Raw:
@@ -1107,7 +1571,12 @@ ROUTES = [
     (re.compile(r"/reservations"), {"POST": h_create, "GET": h_list}),
     (re.compile(r"/reservations/([^/]+)"), {"GET": h_get, "PATCH": h_patch}),
     (re.compile(r"/reservations/([^/]+)/cancel"), {"POST": h_cancel}),
+    (re.compile(r"/reservations/([^/]+)/history"), {"GET": h_history}),
+    (re.compile(r"/reservations/([^/]+)/decision"), {"GET": h_decision}),
     (re.compile(r"/reservation-moves"), {"POST": h_moves}),
+    (re.compile(r"/restaurants/([^/]+)/policies"), {"POST": h_policy_post, "GET": h_policy_list}),
+    (re.compile(r"/series"), {"POST": h_series_create}),
+    (re.compile(r"/series/([^/]+)"), {"GET": h_series_get}),
 ]
 
 

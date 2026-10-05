@@ -360,8 +360,15 @@
           times.map((_, i) => mkCell([t.id], i, freeSingles[i].has(t.id)))));
       }
       for (const pair of rest.combinable || []) {
-        const cap = seatsOf(rest, pair[0]) + seatsOf(rest, pair[1]);
-        if (cap < party) continue;
+        const key = pair.join('+');
+        let cap = seatsOf(rest, pair[0]) + seatsOf(rest, pair[1]);
+        let offered = null;
+        for (const sl of avail.slots) {
+          const o = (sl.available_options || []).find((x) => x.table_ids.join('+') === key);
+          if (o) { offered = o.capacity; break; }
+        }
+        if (offered !== null) cap = offered; // policies can change capacities
+        else if (cap < party) continue;
         rows.push(h('tr', { class: 'combo-row' }, h('th', { scope: 'row' },
           h('span', { class: 'row-label' }, h('span', { class: 'combo-tag' }, 'Combined'), h('br'),
             pair.map((id) => labelOf(rest, id)).join(' + '), h('small', {}, `seats ${cap} together`))),
