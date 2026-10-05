@@ -45,3 +45,11 @@ Deliverable: `stage-4/` in `/Users/chiraanths/Desktop/lockin/Band-hack/band-work
 
 ## G9 Replan instant representability
 - During G2 validation (before planning, before allocating a plan id or storing anything), each instant must render in the restaurant's timezone without error and with a whole-minute UTC offset (valid RFC 3339). Otherwise → 422 `validation_failed`. A preview that fails for any reason allocates no plan id and stores no plan. Build the full 201 body before committing the plan.
+
+## G10 Developer decisions accepted by the architect (d6266e7)
+- A closure window with zero considered bookings gives a feasible empty plan (201, `assignments: []`, `moved_count` 0, `unused_seats` 0); applying it records the closure and increments the restaurant revision once.
+- The planner has a 4-second wall-clock guard; if exceeded (never within the guaranteed size) → 422 `planning_limit`, nothing stored.
+- Closure instants with fractional seconds are floored to whole seconds (as G8).
+- A series amend whose eligible set is empty or all no-op returns 201 and stores its idempotency receipt (it is a successful write), so a replay returns 200; no counters change.
+- Imported schema-4 plans whose assignments name unknown reservation references → 422 with no state change.
+- Restaurants imported from stage-1/2 exports have `manager_user_ids: []`, so replans there return 403 (as G8).
