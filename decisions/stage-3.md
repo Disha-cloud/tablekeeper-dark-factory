@@ -66,3 +66,10 @@ Deliverable: `stage-3/` in `/Users/chiraanths/Desktop/lockin/Band-hack/band-work
 - `GET /restaurants/{id}` also shows `manager_user_ids` (fixture shape). Policy POST/GET responses include `restaurant_id`.
 - Series response carries `count` and `anchor_reference`; an occurrence date beyond the representable calendar → 422 `outside_opening_hours`.
 - UI shows a combination row whenever the API offers that pair in `available_options` for any slot, even if fixture capacities alone would hide it (policies change capacities).
+
+## F14 Developer decisions accepted by the architect (ba2bcfc)
+- Moves occupancy: really changed bookings are conflict-checked against every other confirmed booking, including no-op listed items, which keep their existing occupancy in the resulting set (spec: "Unchanged listed bookings retain their occupancy").
+- `GET /series/{id}` returns 404 (never 401) for a missing or invalid token, consistent with the history/decision rule.
+- Policy `effective_from` is stored as a validated zero-padded `YYYY-MM-DD` and compared as such.
+- Import validates schema-3 history (sequential `seq`) and series links; corrupt state → 422 with no change.
+- Policy 0 keeps the fixture's unbounded numeric values (D13); the stage-3 ranges (1..1440, 0..10080, 1..100) apply to published policies only.
