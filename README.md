@@ -1,22 +1,86 @@
-# Tablekeeper
+<h1 align="center">🍽️ Tablekeeper</h1>
+
+<p align="center">
+  <b>A restaurant reservation service built end to end by a four-agent AI factory.</b><br>
+  4 stages · 158/158 harness checks passing · 74 minutes · 8 human messages
+</p>
+
+<p align="center">
+  <a href="https://drive.google.com/file/d/1cjMDOAg_PpCGJWwZcF0THoYp4QxtEdTh/view?usp=sharing">
+    <img src="https://img.shields.io/badge/%E2%96%B6%20WATCH%20THE%20DEMO%20VIDEO-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="Watch the demo video" height="56">
+  </a>
+  &nbsp;&nbsp;
+  <a href="https://drive.google.com/file/d/1ep1vJUw_nLvg-NmDnZ1Hw8Xb0EB_yn6d/view?usp=sharing">
+    <img src="https://img.shields.io/badge/%F0%9F%93%8A%20VIEW%20THE%20SLIDES-4285F4?style=for-the-badge&logo=googleslides&logoColor=white" alt="View the presentation slides" height="56">
+  </a>
+</p>
+
+<h3 align="center">
+  🎬 <a href="https://drive.google.com/file/d/1cjMDOAg_PpCGJWwZcF0THoYp4QxtEdTh/view?usp=sharing">Presentation &amp; demo video</a>
+  &nbsp;·&nbsp;
+  📑 <a href="https://drive.google.com/file/d/1ep1vJUw_nLvg-NmDnZ1Hw8Xb0EB_yn6d/view?usp=sharing">Presentation slides</a>
+</h3>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/stage%201-120%2F120-2ea44f?style=flat-square" alt="Stage 1 120/120">
+  <img src="https://img.shields.io/badge/stage%202-25%2F25-2ea44f?style=flat-square" alt="Stage 2 25/25">
+  <img src="https://img.shields.io/badge/stage%203-7%2F7-2ea44f?style=flat-square" alt="Stage 3 7/7">
+  <img src="https://img.shields.io/badge/stage%204-6%2F6-2ea44f?style=flat-square" alt="Stage 4 6/6">
+  <img src="https://img.shields.io/badge/python-3.12-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker ready">
+</p>
+
+---
+
+## ✨ What it is
 
 Tablekeeper is a restaurant reservation service. Diners search availability, book a table and
 get a confirmation reference. They can then cancel or amend that booking, or move several
 bookings together atomically. Each restaurant has its own tables, opening hours, slot grid and
-cancellation policy. Two confirmed reservations can never hold the same table at overlapping
-times, even under concurrent requests. Retries and rejected requests never create duplicate
-or partial bookings.
+cancellation policy.
 
-The service was built in four stages. Each stage is a complete, independently buildable
-folder (`stage-1/` … `stage-4/`), and every stage includes everything before it. A four-seat
-agent factory produced all the code (see [FACTORY.md](FACTORY.md)).
+- 🔒 **No double bookings.** Two confirmed reservations can never hold the same table at
+  overlapping times, even under concurrent requests.
+- 🔁 **Safe retries.** Retries and rejected requests never create duplicate or partial bookings.
+- 🧱 **Four self-contained stages.** Each stage is a complete, independently buildable folder
+  (`stage-1/` … `stage-4/`), and every stage includes everything before it.
 
-## Presentation
+## 🤖 Built by an agent factory
 
-- [Presentation slides](https://drive.google.com/file/d/1ep1vJUw_nLvg-NmDnZ1Hw8Xb0EB_yn6d/view?usp=sharing)
-- [Presentation and demo video](https://drive.google.com/file/d/1cjMDOAg_PpCGJWwZcF0THoYp4QxtEdTh/view?usp=sharing)
+All the code was produced by four AI seats working in one BAND room, with the human sending
+only the four seat mandates and four stage dispatches. The full story, with timings, is in
+[FACTORY.md](FACTORY.md).
 
-## Repository layout
+```mermaid
+flowchart LR
+    H([👤 Human<br/>stage dispatch]) --> A[🏛️ Architect<br/>Opus 5.5]
+    A -- decisions + handoff --> D[🛠️ Developer<br/>Sonnet 5]
+    D -- committed revision --> R[🔍 Reviewer<br/>Sonnet 5]
+    R -- REJECT + findings --> D
+    R -- ACCEPT --> V[✅ Release verifier<br/>Sonnet 5]
+    V -- ACCEPT --> A
+    A -- stage done --> H
+```
+
+| | Stage 1 | Stage 2 | Stage 3 | Stage 4 |
+|---|---|---|---|---|
+| **Adds** | Reservations API | Booking UI + combined tables | Policies, history, recurring series | Closure replans, series amend |
+| **Wall clock** | 12m 16s | 23m 21s | 16m 48s | 18m 30s |
+| **Harness** | 120/120 | +25/25 | +7/7 | +6/6 |
+| **Accepted at** | `cf904c2` | `74fb95b` | `ba2bcfc` | `d6266e7` |
+
+> 🛡️ **The factory catches bad work.** In Stage 2 the reviewer rejected a submission whose own
+> self-tests reported no failures, and the developer fixed it before acceptance
+> ([FACTORY.md §4](FACTORY.md#4-proof-the-factory-catches-bad-work-the-stage-2-rejection)).
+
+## 🧭 Contents
+
+- [Repository layout](#-repository-layout)
+- [Build and run](#-build-and-run)
+- [Seed demo data for manual testing](#seed-demo-data-for-manual-testing)
+- [What each stage adds](#-what-each-stage-adds)
+
+## 📁 Repository layout
 
 | Path | Contents |
 |---|---|
@@ -26,7 +90,7 @@ agent factory produced all the code (see [FACTORY.md](FACTORY.md)).
 | `mandates/` | The four seat mandates (architect, developer, reviewer, release-verifier) |
 | `room.json` | Full, unfiltered export of the BAND room `tablekeeper-graded` in which the factory ran |
 
-## Build and run
+## 🚀 Build and run
 
 Every stage follows the same pattern (from that stage's `RUN.md`). Run it from the
 repository root:
@@ -105,7 +169,7 @@ before it is gone. You can re-run it at any time to start over. What to try once
 - **Look up and cancel:** sign in at `/login` as `ada@example.com` / `correct horse`, then
   enter `DEMO0001` at `/lookup`.
 
-### Self-tests
+### 🧪 Self-tests
 
 Each stage ships the developer's own self-tests. They need the container running on port 8080.
 
@@ -116,7 +180,7 @@ Each stage ships the developer's own self-tests. They need the container running
 | 3 | `python3 stage-3/selftest/run.py` (stage 1/2 API regression) · `python3 stage-3/selftest/s3.py` (stage 3 API) · `python stage-3/selftest/ui.py` · `python3 stage-3/selftest/upgrade.py` (from stage-1/2 images on ports 8081/8082) |
 | 4 | `python3 stage-4/selftest/run.py` · `python3 stage-4/selftest/s3.py` · `python3 stage-4/selftest/s4.py` (planner vs. brute force, closures, series amend, schema 4) · `python stage-4/selftest/ui.py` · `python3 stage-4/selftest/upgrade.py` (from stage-1/2/3 images on ports 8081–8083) |
 
-### Harness verification
+### 📋 Harness verification
 
 From `dark-factory-wearedevs/` with its virtualenv active:
 
@@ -129,7 +193,7 @@ The final `--all` run (`band-work/checks/graded-all-final2/`, revision `b7e5a9f`
 every stage. Each folder claimed its own stage (`highest_contiguous` 1, 2, 3, 4) with
 `share` 1.0. Counts are in [FACTORY.md §3](FACTORY.md#3-measured-cost-and-time-per-stage).
 
-## What each stage adds
+## 🧩 What each stage adds
 
 ### Stage 1: reservations API (`stage-1/`, accepted at `cf904c2`)
 - Restaurants, tables, opening hours, slot grid and availability search.
